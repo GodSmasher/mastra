@@ -5,6 +5,7 @@ import { delay, http, HttpResponse } from 'msw';
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { useThemeSnapshots } from '../hooks/use-theme-snapshots';
 import { SankeySignals } from '../sankey-signals';
 import { timelineTickPositions } from '../snapshot-timeline-data';
 import { computeThemeShareDeltas, themeShareSeries } from '../theme-compare-data';
@@ -40,12 +41,19 @@ class ChartResizeObserver implements ResizeObserver {
 
 function ControlledSankeySignals() {
   const [selectedThemeId, setSelectedThemeId] = useState<string>();
+  const [selectedFrameId, setSelectedFrameId] = useState<string>();
+  const snapshotsQuery = useThemeSnapshots('support-agent', 'agent', ['goal', 'outcome', 'behavior', 'sentiment']);
+  const snapshots = [...(snapshotsQuery.data?.snapshots ?? [])].sort((left, right) => left.ordinal - right.ordinal);
+  const frameId = selectedFrameId ?? snapshots[0]?.snapshotId;
+  if (!frameId) return null;
   return (
     <SankeySignals
       entityId="support-agent"
       signalNames={['goal', 'outcome', 'behavior', 'sentiment']}
       selectedThemeId={selectedThemeId}
       onSelectedThemeIdChange={setSelectedThemeId}
+      selectedFrameId={frameId}
+      onFrameIdChange={setSelectedFrameId}
     />
   );
 }
@@ -182,8 +190,8 @@ describe('SankeySignals compare mode', () => {
       fireEvent.click(screen.getByRole('tab', { name: 'Compare' }));
 
       const comparison = await screen.findByRole('region', { name: 'Snapshot comparison' });
-      expect(await within(comparison).findByText('Jun 24–Jul 1, 2026 · 50 traces · 10 themes')).not.toBeNull();
-      expect(within(comparison).getByText('Jul 1–8, 2026 · 50 traces · 9 themes')).not.toBeNull();
+      expect(await within(comparison).findByText('Jun 24 – Jul 1, 2026 · 50 traces · 10 themes')).not.toBeNull();
+      expect(within(comparison).getByText('Jul 1 – 8, 2026 · 50 traces · 9 themes')).not.toBeNull();
       expect(within(comparison).queryByText(/snapshot \d/)).toBeNull();
     });
 
@@ -234,7 +242,7 @@ describe('SankeySignals compare mode', () => {
       expect(within(track).queryByText('A')).toBeNull();
       expect(within(track).queryByText('B')).toBeNull();
       // Snapshot summaries stay visible as plain text, not buttons.
-      const summary = await within(comparison).findByText('Jun 24–Jul 1, 2026 · 50 traces · 10 themes');
+      const summary = await within(comparison).findByText('Jun 24 – Jul 1, 2026 · 50 traces · 10 themes');
       expect(summary.closest('button')).toBeNull();
     });
 
@@ -325,7 +333,7 @@ describe('SankeySignals compare mode', () => {
       await screen.findByRole('region', { name: 'Trace signal theme flow' });
       fireEvent.click(screen.getByRole('tab', { name: 'Compare' }));
       const comparison = await screen.findByRole('region', { name: 'Snapshot comparison' });
-      expect(await within(comparison).findByText(/^Jul 8, 2026, 00:00/)).not.toBeNull();
+      expect(await within(comparison).findByText(/^Jul 8, 2026, 12:00 AM/)).not.toBeNull();
 
       const track = within(comparison).getByRole('group', { name: 'Snapshot landmarks' });
       const ticks = within(track).getAllByRole('button', { name: /Snapshot \d+ of/ });
@@ -333,9 +341,9 @@ describe('SankeySignals compare mode', () => {
       // later point is nearest and moves; the earlier point stays put.
       fireEvent.click(requiredElementAt(ticks, 3));
 
-      expect(await within(comparison).findByText(/^Jul 7, 2026, 18:00/)).not.toBeNull();
-      expect(within(comparison).getByText(/^Jul 1, 2026, 04:00/)).not.toBeNull();
-      expect(within(comparison).queryByText(/^Jul 8, 2026, 00:00/)).toBeNull();
+      expect(await within(comparison).findByText(/^Jul 7, 2026, 6:00 PM/)).not.toBeNull();
+      expect(within(comparison).getByText(/^Jul 1, 2026, 4:00 AM/)).not.toBeNull();
+      expect(within(comparison).queryByText(/^Jul 8, 2026, 12:00 AM/)).toBeNull();
     });
 
     it('moves the grabbed point even when the other point is nearer', async () => {
@@ -343,7 +351,7 @@ describe('SankeySignals compare mode', () => {
       await screen.findByRole('region', { name: 'Trace signal theme flow' });
       fireEvent.click(screen.getByRole('tab', { name: 'Compare' }));
       const comparison = await screen.findByRole('region', { name: 'Snapshot comparison' });
-      await within(comparison).findByText(/^Jul 8, 2026, 00:00/);
+      await within(comparison).findByText(/^Jul 8, 2026, 12:00 AM/);
 
       const track = within(comparison).getByRole('group', { name: 'Snapshot landmarks' });
       const ticks = within(track).getAllByRole('button', { name: /Snapshot \d+ of/ });
@@ -352,9 +360,9 @@ describe('SankeySignals compare mode', () => {
       fireEvent.click(requiredElementAt(ticks, 0));
       fireEvent.click(requiredElementAt(ticks, 3));
 
-      expect(await within(comparison).findByText(/^Jul 7, 2026, 18:00/)).not.toBeNull();
-      expect(within(comparison).getByText(/^Jul 8, 2026, 00:00/)).not.toBeNull();
-      expect(within(comparison).queryByText(/^Jul 1, 2026, 04:00/)).toBeNull();
+      expect(await within(comparison).findByText(/^Jul 7, 2026, 6:00 PM/)).not.toBeNull();
+      expect(within(comparison).getByText(/^Jul 8, 2026, 12:00 AM/)).not.toBeNull();
+      expect(within(comparison).queryByText(/^Jul 1, 2026, 4:00 AM/)).toBeNull();
     });
   });
 });

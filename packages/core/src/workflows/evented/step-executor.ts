@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
 import { TripWire } from '../../agent/trip-wire';
+import type { ActorSignal } from '../../auth/ee';
 import { MastraBase } from '../../base';
 import type { RequestContext } from '../../di';
 import { MastraError, MastraNonRetryableError, ErrorDomain, ErrorCategory } from '../../error';
@@ -11,7 +11,7 @@ import { EntityType, SpanType, createObservabilityContext } from '../../observab
 import { executeWithContext } from '../../observability/utils';
 import { ToolStream } from '../../tools/stream';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
-import { runAgentEntry, runMappingEntry, runToolEntry } from '../entry-executors';
+import { runAgentEntry, runClassifierEntry, runMappingEntry, runToolEntry } from '../entry-executors';
 import { getStepResult } from '../step';
 import type { InnerOutput, LoopConditionFunction, SuspendOptions } from '../step';
 import { getEntryComponent, getEntryId, getEntrySchemas } from '../step-entry';
@@ -71,6 +71,8 @@ export class StepExecutor extends MastraBase {
     stepResults: Record<string, StepResult<any, any, any, any>>;
     state: Record<string, any>;
     requestContext: RequestContext;
+    /** Caller identity, forwarded to step/tool/agent execution contexts (parity with the default engine). */
+    actor?: ActorSignal;
     retryCount?: number;
     foreachIdx?: number;
     validateInputs?: boolean;
@@ -146,6 +148,10 @@ export class StepExecutor extends MastraBase {
     // This matches the default engine's behavior where setState captures
     // the update and applies it AFTER the step completes
     let stateUpdate: Record<string, any> | undefined;
+    // Track only the keys explicitly written via setState() so parallel branch
+    // aggregation can merge sibling updates key-by-key instead of clobbering
+    // each other with full snapshots (#22319)
+    let stateDelta: Record<string, any> | undefined;
 
     // The evented engine, unlike the default engine, has no per-step span.
     // Emit the WORKFLOW_STEP span here so the step's child spans nest under it
@@ -168,7 +174,7 @@ export class StepExecutor extends MastraBase {
         throw validationError;
       }
 
-      const callId = randomUUID();
+      const callId = globalThis.crypto.randomUUID();
       const outputWriter = this.createOutputWriter(runId);
 
       const stepOutput = await executeWithContext({
@@ -180,6 +186,7 @@ export class StepExecutor extends MastraBase {
               runId,
               mastra: this.mastra!,
               requestContext,
+              actor: params.actor,
               inputData,
               state: params.state,
               setState: async (newState: Record<string, any>) => {
@@ -187,6 +194,7 @@ export class StepExecutor extends MastraBase {
                 // This matches default engine behavior where state changes
                 // are applied AFTER the step completes, not during execution
                 stateUpdate = { ...(stateUpdate ?? params.state), ...newState };
+                stateDelta = { ...stateDelta, ...newState };
               },
               retryCount,
               resumeData: params.resumeData,
@@ -261,6 +269,8 @@ export class StepExecutor extends MastraBase {
               return runAgentEntry(entry, executionContext, this.mastra);
             case 'tool':
               return runToolEntry(entry, executionContext, this.mastra);
+            case 'classifier':
+              return runClassifierEntry(entry, executionContext);
             case 'mapping':
               return runMappingEntry(entry, executionContext);
           }
@@ -277,7 +287,10 @@ export class StepExecutor extends MastraBase {
       const finalState = stateUpdate ?? params.state;
 
       const baseStepInfo = omitPriorSuspensionFields(stepInfo) as typeof stepInfo;
-      let finalResult: StepResult<any, any, any, any> & { __state?: Record<string, any> };
+      let finalResult: StepResult<any, any, any, any> & {
+        __state?: Record<string, any>;
+        __stateDelta?: Record<string, any>;
+      };
       if (suspended) {
         finalResult = {
           ...baseStepInfo,
@@ -313,6 +326,10 @@ export class StepExecutor extends MastraBase {
           output: stepOutput,
           __state: finalState,
         };
+      }
+
+      if (stateDelta) {
+        finalResult.__stateDelta = stateDelta;
       }
 
       if (finalResult.status === 'success') {
@@ -376,6 +393,7 @@ export class StepExecutor extends MastraBase {
     stepResults: Record<string, StepResult<any, any, any, any>>;
     state: Record<string, any>;
     requestContext: RequestContext;
+    actor?: ActorSignal;
     retryCount?: number;
     abortController?: AbortController;
   }): Promise<number[]> {
@@ -384,13 +402,14 @@ export class StepExecutor extends MastraBase {
     const abortController = params.abortController ?? new AbortController();
 
     const results = await Promise.all(
-      step.conditions.map(condition => {
+      step.conditions.map(async condition => {
         try {
-          return this.evaluateCondition({
+          return await this.evaluateCondition({
             workflowId: params.workflowId,
             condition,
             runId,
             requestContext,
+            actor: params.actor,
             inputData: params.input,
             state: params.state,
             retryCount,
@@ -400,7 +419,19 @@ export class StepExecutor extends MastraBase {
             iterationCount: 0,
           });
         } catch (e) {
-          this.mastra?.getLogger()?.error('error evaluating condition', e);
+          const errorInstance = getErrorFromUnknown(e, { serializeStack: false });
+          const mastraError = new MastraError(
+            {
+              id: 'WORKFLOW_CONDITION_EVALUATION_FAILED',
+              domain: ErrorDomain.MASTRA_WORKFLOW,
+              category: ErrorCategory.USER,
+              details: { workflowId: params.workflowId, runId },
+            },
+            errorInstance,
+          );
+          const logger = this.mastra?.getLogger();
+          logger?.trackException(mastraError);
+          logger?.error('Error evaluating condition: ' + errorInstance.stack);
           return false;
         }
       }),
@@ -426,6 +457,7 @@ export class StepExecutor extends MastraBase {
     stepResults,
     state,
     requestContext,
+    actor,
     abortController,
     retryCount = 0,
     iterationCount,
@@ -438,11 +470,12 @@ export class StepExecutor extends MastraBase {
     stepResults: Record<string, StepResult<any, any, any, any>>;
     state: Record<string, any>;
     requestContext: RequestContext;
+    actor?: ActorSignal;
     abortController: AbortController;
     retryCount?: number;
     iterationCount: number;
   }): Promise<boolean> {
-    const callId = randomUUID();
+    const callId = globalThis.crypto.randomUUID();
     const outputWriter = this.createOutputWriter(runId);
 
     return condition(
@@ -452,15 +485,14 @@ export class StepExecutor extends MastraBase {
           runId,
           mastra: this.mastra!,
           requestContext,
+          actor,
           inputData,
           state,
           retryCount,
           resumeData: resumeData,
           getInitData: () => stepResults?.input as any,
           getStepResult: getStepResult.bind(this, stepResults),
-          bail: (_result: any) => {
-            throw new Error('Not implemented');
-          },
+          bail: (() => {}) as () => InnerOutput,
           writer: new ToolStream(
             {
               prefix: 'workflow-step',
@@ -499,6 +531,7 @@ export class StepExecutor extends MastraBase {
     stepResults: Record<string, StepResult<any, any, any, any>>;
     state?: Record<string, any>;
     requestContext: RequestContext;
+    actor?: ActorSignal;
     retryCount?: number;
     abortController?: AbortController;
   }): Promise<number> {
@@ -516,7 +549,7 @@ export class StepExecutor extends MastraBase {
     }
 
     try {
-      const callId = randomUUID();
+      const callId = globalThis.crypto.randomUUID();
       const outputWriter = this.createOutputWriter(runId);
 
       return await step.fn(
@@ -526,6 +559,7 @@ export class StepExecutor extends MastraBase {
             runId,
             mastra: this.mastra!,
             requestContext,
+            actor: params.actor,
             inputData: params.input,
             state: currentState,
             setState: async (newState: Record<string, any>) => {
@@ -582,6 +616,7 @@ export class StepExecutor extends MastraBase {
     stepResults: Record<string, StepResult<any, any, any, any>>;
     state?: Record<string, any>;
     requestContext: RequestContext;
+    actor?: ActorSignal;
     retryCount?: number;
     abortController?: AbortController;
   }): Promise<number> {
@@ -599,7 +634,7 @@ export class StepExecutor extends MastraBase {
     }
 
     try {
-      const callId = randomUUID();
+      const callId = globalThis.crypto.randomUUID();
       const outputWriter = this.createOutputWriter(runId);
 
       const result = await step.fn(
@@ -609,6 +644,7 @@ export class StepExecutor extends MastraBase {
             runId,
             mastra: this.mastra!,
             requestContext,
+            actor: params.actor,
             inputData: params.input,
             state: currentState,
             setState: async (newState: Record<string, any>) => {

@@ -1,7 +1,7 @@
 import { Badge } from '@mastra/playground-ui/components/Badge';
-import { Button } from '@mastra/playground-ui/components/Button';
-import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
 import { Input } from '@mastra/playground-ui/components/Input';
+import { SegmentedControl, SegmentedControlItem } from '@mastra/playground-ui/components/SegmentedControl';
+import { SettingsRow } from '@mastra/playground-ui/new/settings';
 import { Txt } from '@mastra/playground-ui/components/Txt';
 import { useState } from 'react';
 
@@ -27,22 +27,6 @@ function choiceToAttachment(choice: AttachmentChoice): 'auto' | boolean {
   if (choice === 'on') return true;
   if (choice === 'off') return false;
   return 'auto';
-}
-
-function Field({ label, hint, children }: { label: string; hint: string; children: React.ReactNode }) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex flex-col">
-        <Txt as="span" variant="ui-sm" className="text-icon5">
-          {label}
-        </Txt>
-        <Txt as="span" variant="ui-xs" className="text-icon3">
-          {hint}
-        </Txt>
-      </div>
-      {children}
-    </div>
-  );
 }
 
 function ThresholdInput({
@@ -81,12 +65,6 @@ function ThresholdInput({
   );
 }
 
-/**
- * Persisted observational-memory settings, optionally synchronized to an
- * active session. With `factoryId` set, the section edits the factory
- * project's shared settings (used by board runs and channel sessions) instead
- * of the caller's personal row.
- */
 export function OMSection({
   resourceId,
   scope,
@@ -130,36 +108,34 @@ export function OMSection({
   };
 
   if (loading) {
-    return <SkeletonRows label="Loading observational-memory settings" rows={4} rowClassName="h-10 w-full" />;
+    return (
+      <div className="px-4 py-3">
+        <SkeletonRows label="Loading observational-memory settings" rows={4} rowClassName="h-10 w-full" />
+      </div>
+    );
   }
 
   const attachmentChoice = attachmentToChoice(config?.observeAttachments ?? 'auto');
-  const attachmentOptions: { value: AttachmentChoice; label: string }[] = [
-    { value: 'auto', label: 'Auto' },
-    { value: 'on', label: 'On' },
-    { value: 'off', label: 'Off' },
-  ];
-
   return (
-    <div className="flex flex-col gap-4">
+    <>
       {error && (
-        <Txt as="p" variant="ui-sm" className="text-notice-destructive-fg">
+        <Txt as="p" variant="caption" className="text-destructive-foreground px-4 py-3">
           {error}
         </Txt>
       )}
 
       {config && !modelsAvailable && (
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 px-4 py-3">
           <Badge size="md" variant="warning">
             Model credentials required
           </Badge>
-          <Txt as="p" variant="ui-xs" className="text-icon3">
+          <Txt as="p" variant="meta" className="text-muted-foreground">
             Observational-memory model calls may fail until credentials are configured.
           </Txt>
         </div>
       )}
 
-      <Field label="Observer model" hint="Summarizes the conversation into observations">
+      <SettingsRow label="Observer model" description="Summarizes the conversation into observations">
         <ModelCombobox
           models={models}
           value={config?.observerModelId ?? ''}
@@ -167,9 +143,9 @@ export function OMSection({
           disabled={busy}
           onValueChange={modelId => switchModel('observer', modelId)}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field label="Reflector model" hint="Distills observations into longer-term memory">
+      <SettingsRow label="Reflector model" description="Distills observations into longer-term memory">
         <ModelCombobox
           models={models}
           value={config?.reflectorModelId ?? ''}
@@ -177,50 +153,53 @@ export function OMSection({
           disabled={busy}
           onValueChange={modelId => switchModel('reflector', modelId)}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field label="Messages before observation" hint="Message tokens processed before the observer runs.">
+      <SettingsRow label="Messages before observation" description="Message tokens processed before the observer runs.">
         {config && (
-          <ThresholdInput
-            key={config.observationThreshold}
-            value={config.observationThreshold}
-            disabled={busy}
-            onCommit={observationThreshold => {
-              thresholdsMutation.mutate({ observationThreshold });
-            }}
-          />
+          <div className="w-full max-w-40">
+            <ThresholdInput
+              key={config.observationThreshold}
+              value={config.observationThreshold}
+              disabled={busy}
+              onCommit={observationThreshold => {
+                thresholdsMutation.mutate({ observationThreshold });
+              }}
+            />
+          </div>
         )}
-      </Field>
+      </SettingsRow>
 
-      <Field label="Observations before reflection" hint="Observation tokens accumulated before the reflector runs.">
+      <SettingsRow
+        label="Observations before reflection"
+        description="Observation tokens accumulated before the reflector runs."
+      >
         {config && (
-          <ThresholdInput
-            key={config.reflectionThreshold}
-            value={config.reflectionThreshold}
-            disabled={busy}
-            onCommit={reflectionThreshold => {
-              thresholdsMutation.mutate({ reflectionThreshold });
-            }}
-          />
+          <div className="w-full max-w-40">
+            <ThresholdInput
+              key={config.reflectionThreshold}
+              value={config.reflectionThreshold}
+              disabled={busy}
+              onCommit={reflectionThreshold => {
+                thresholdsMutation.mutate({ reflectionThreshold });
+              }}
+            />
+          </div>
         )}
-      </Field>
+      </SettingsRow>
 
-      <Field label="Observe attachments" hint="Whether attached files are included in observations">
-        <ButtonsGroup spacing="close" role="group" aria-label="Observe attachments">
-          {attachmentOptions.map(option => (
-            <Button
-              key={option.value}
-              variant={attachmentChoice === option.value ? 'primary' : 'outline'}
-              size="sm"
-              aria-pressed={attachmentChoice === option.value}
-              disabled={busy || !config}
-              onClick={() => attachmentsMutation.mutate({ value: choiceToAttachment(option.value) })}
-            >
-              {option.label}
-            </Button>
-          ))}
-        </ButtonsGroup>
-      </Field>
-    </div>
+      <SettingsRow label="Observe attachments" description="Whether attached files are included in observations">
+        <SegmentedControl
+          aria-label="Observe attachments"
+          value={attachmentChoice}
+          disabled={busy || !config}
+          onValueChange={choice => attachmentsMutation.mutate({ value: choiceToAttachment(choice) })}
+        >
+          <SegmentedControlItem value="auto">Auto</SegmentedControlItem>
+          <SegmentedControlItem value="on">On</SegmentedControlItem>
+          <SegmentedControlItem value="off">Off</SegmentedControlItem>
+        </SegmentedControl>
+      </SettingsRow>
+    </>
   );
 }

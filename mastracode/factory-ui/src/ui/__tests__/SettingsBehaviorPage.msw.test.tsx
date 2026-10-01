@@ -1,8 +1,8 @@
 /**
  * BDD coverage for the factory Behavior settings page
  * (`/factories/:factoryId/settings/behavior`). The page lives outside any
- * workspace route, so it must address the factory-level session (the
- * `resourceId` returned by the sandbox `/ensure` route) — a regression here
+ * workspace route, so it must address the factory-level session (whose
+ * `resourceId` is the factory project id) — a regression here
  * leaves every toggle permanently disabled because no session settings or
  * permissions can load.
  */
@@ -19,7 +19,7 @@ import { createAppRoutes } from '../router';
 const API = `${TEST_BASE_URL}/api/agent-controller/code`;
 const FACTORY_ID = 'fp-1';
 const REPO_ID = 'repo-1';
-/** The factory-level session address returned by the /ensure route. */
+/** The factory-level session address: the factory project id itself. */
 const FACTORY_RESOURCE_ID = 'fp-1';
 
 function renderBehaviorSettings() {
@@ -63,15 +63,6 @@ function stubBehaviorPage() {
             ],
           },
         ],
-      }),
-    ),
-    http.post(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/ensure`, () =>
-      HttpResponse.json({
-        resourceId: FACTORY_RESOURCE_ID,
-        factoryProjectId: FACTORY_ID,
-        projectRepositoryId: REPO_ID,
-        sandboxId: 'sb-1',
-        sandboxWorkdir: '/workspace/mastra',
       }),
     ),
     http.post(`${API}/sessions`, async ({ request }) => {
@@ -147,12 +138,16 @@ describe('Behavior settings page (factory scope)', () => {
 
     renderBehaviorSettings();
 
-    const readGroup = await screen.findByRole('group', { name: 'Read permission' });
-    const readAllow = within(readGroup).getByRole('button', { name: 'Allow' });
+    const readGroup = await screen.findByRole('radiogroup', { name: 'Read permission' });
+    const readAllow = within(readGroup).getByRole('radio', { name: 'Allow' });
     await waitFor(() => expect(readAllow).toBeEnabled());
     expect(seen.permissionResourceIds).toContain(FACTORY_RESOURCE_ID);
 
     await user.click(readAllow);
+
+    // Optimistic: selected right away, and the control never locks while the write is in flight.
+    expect(readAllow).toHaveAttribute('aria-checked', 'true');
+    expect(readAllow).toBeEnabled();
 
     await waitFor(() => expect(seen.permissionWrites).toHaveLength(1));
     expect(seen.permissionWrites[0]).toEqual({

@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import { isLeaseProvider, NoopLeaseProvider } from '@mastra/core/events';
 import type { LeaseProvider, PubSub } from '@mastra/core/events';
 import { MastraWorker } from '@mastra/core/worker';
@@ -13,7 +11,8 @@ import type {
 import type { GithubIssueReconciler } from './issue-reconciler.js';
 import type { GithubPullRequestReconciler, ReconcileRepository } from './rules.js';
 
-export const DEFAULT_GITHUB_RECONCILE_INTERVAL_MS = 5 * 60_000;
+// Webhooks are the primary sync; the sweeps only catch drift, so hourly.
+export const DEFAULT_GITHUB_RECONCILE_INTERVAL_MS = 60 * 60_000;
 const MIN_LEASE_TTL_MS = 30_000;
 const LEASE_KEY = 'github:pull-request-reconcile';
 
@@ -35,11 +34,6 @@ export interface GithubReconcileWorkerConfig {
   reconcile?: GithubPullRequestReconciler;
   reconcileIssues?: GithubIssueReconciler;
   sourceControl: GithubReconcileRepositorySource;
-  /**
-   * Base-checkpoint freshness sweep, run after the reconcilers within the same
-   * lease. Rebuilds stale/missing base checkpoints for configured repos.
-   */
-  sweepBaseCheckpoints?: () => Promise<void>;
   intervalMs?: number;
   issueIntervalMs?: number;
   now?: () => number;
@@ -56,11 +50,10 @@ export class GithubReconcileWorker extends MastraWorker {
   readonly #reconcile: GithubPullRequestReconciler | undefined;
   readonly #reconcileIssues: GithubIssueReconciler | undefined;
   readonly #sourceControl: GithubReconcileRepositorySource;
-  readonly #sweepBaseCheckpoints: (() => Promise<void>) | undefined;
   readonly #intervalMs: number;
   readonly #issueIntervalMs: number;
   readonly #leaseTtlMs: number;
-  readonly #leaseOwner = randomUUID();
+  readonly #leaseOwner = globalThis.crypto.randomUUID();
   readonly #now: () => number;
 
   #running = false;
@@ -78,7 +71,6 @@ export class GithubReconcileWorker extends MastraWorker {
     this.#reconcile = config.reconcile;
     this.#reconcileIssues = config.reconcileIssues;
     this.#sourceControl = config.sourceControl;
-    this.#sweepBaseCheckpoints = config.sweepBaseCheckpoints;
     this.#intervalMs = config.intervalMs ?? DEFAULT_GITHUB_RECONCILE_INTERVAL_MS;
     this.#issueIntervalMs = config.issueIntervalMs ?? this.#intervalMs;
     if (!Number.isFinite(this.#intervalMs) || this.#intervalMs <= 0) {
@@ -191,7 +183,10 @@ export class GithubReconcileWorker extends MastraWorker {
           const { errors, ...counts } = await this.#reconcile(targets);
           const context = { ...counts, candidateRepositories: targets.length, durationMs: Date.now() - startedAt };
           if (counts.failed > 0) {
-            this.deps?.logger.warn('GitHub pull request reconcile sweep completed with failures', { ...context, errors });
+            this.deps?.logger.warn('GitHub pull request reconcile sweep completed with failures', {
+              ...context,
+              errors,
+            });
           } else if (counts.merged > 0 || counts.closed > 0) {
             this.deps?.logger.info('GitHub pull request reconcile replayed missed merges/closes', context);
           } else {
@@ -213,6 +208,8 @@ export class GithubReconcileWorker extends MastraWorker {
             this.deps?.logger.warn('GitHub issue reconcile sweep completed with failures', { ...context, errors });
           } else if (counts.closed > 0) {
             this.deps?.logger.info('GitHub issue reconcile replayed closed work items', context);
+          } else if (counts.relabeled > 0) {
+            this.deps?.logger.info('GitHub issue reconcile re-applied label routing', context);
           } else if (counts.updated > 0) {
             this.deps?.logger.info('GitHub issue reconcile patched stale metadata', context);
           } else {
@@ -225,16 +222,6 @@ export class GithubReconcileWorker extends MastraWorker {
         }
       } else if (reconcileIssues && this.#reconcileIssues && !hasLease) {
         this.deps?.logger.debug('GitHub issue reconcile skipped: lease lost during pull-request sweep');
-      }
-
-      if (this.#sweepBaseCheckpoints && hasLease) {
-        try {
-          await this.#sweepBaseCheckpoints();
-        } catch (error) {
-          this.deps?.logger.warn('GitHub base-checkpoint freshness sweep failed', {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
       }
     } finally {
       clearInterval(renewalTimer);

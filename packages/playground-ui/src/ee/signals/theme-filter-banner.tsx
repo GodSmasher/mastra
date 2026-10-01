@@ -1,12 +1,14 @@
-import { X } from 'lucide-react';
-import { getSignalHue } from './signal-colors';
-import { formatSignalName } from './signal-formatting';
+import type { SignalCatalogEntry } from '@mastra/client-js';
+import { X, Eye } from 'lucide-react';
+import { getSignalColor } from './signal-colors';
+import { signalLabel } from './signal-formatting';
 import type { ThemeSelection } from './theme-drilldown-data';
+import { useTraceIntelligence } from './use-trace-intelligence';
 import { Button } from '@/ds/components/Button';
-import { nodeColor } from '@/ds/components/SankeyChart';
+import { Txt } from '@/ds/components/Txt';
 
-function selectionLabel(selection: ThemeSelection) {
-  return `${formatSignalName(selection.signalName)} · ${selection.kind === 'theme' ? selection.label : 'Noise'}`;
+function selectionLabel(catalog: readonly SignalCatalogEntry[], selection: ThemeSelection) {
+  return `${signalLabel(catalog, selection.signalName)} · ${selection.kind === 'theme' ? selection.label : 'Noise'}`;
 }
 
 function filterSummary({
@@ -49,20 +51,19 @@ export function ThemeFilterBanner({
   onRemove: (signalName: ThemeSelection['signalName']) => void;
   onClear: () => void;
 }) {
-  const colors = selections.map(selection => nodeColor(getSignalHue(selection.signalName)));
+  const { signalCatalog } = useTraceIntelligence();
+  const colors = selections.map(selection => getSignalColor(selection.signalName));
   const latestSelection = selections.at(-1);
-  const backgroundGradient = `linear-gradient(90deg, ${colors
-    .map(color => `color-mix(in srgb, ${color} 8%, transparent)`)
-    .join(', ')})`;
-  const borderGradient = `linear-gradient(90deg, ${colors
-    .map(color => `color-mix(in srgb, ${color} 35%, transparent)`)
-    .join(', ')})`;
+  const borderGradient = `linear-gradient(90deg, ${colors.length > 1 ? colors.join(', ') : `${colors[0]}, ${colors[0]}`})`;
 
   return (
     <section
       aria-label="Active theme drill-in"
       className="relative flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-transparent px-3 py-2"
-      style={{ backgroundImage: `${backgroundGradient}, ${borderGradient}`, backgroundClip: 'padding-box, border-box' }}
+      style={{
+        backgroundImage: `linear-gradient(var(--card), var(--card)), ${borderGradient}`,
+        backgroundClip: 'padding-box, border-box',
+      }}
     >
       {selections.map((selection, index) => {
         const color = colors[index];
@@ -70,27 +71,30 @@ export function ThemeFilterBanner({
           <button
             key={selection.signalName}
             aria-label={
-              selections.length === 1 ? `Clear ${selection.kind} filter` : `Clear filter ${selectionLabel(selection)}`
+              selections.length === 1
+                ? `Clear ${selection.kind} filter`
+                : `Clear filter ${selectionLabel(signalCatalog, selection)}`
             }
-            className="border-border1 bg-surface2 text-neutral6 hover:bg-surface4 flex items-center gap-1.5 rounded-full border py-1 pr-2 pl-2.5 text-xs font-medium transition-colors"
+            className="state-layer flex items-center gap-1.5 rounded-full border border-border bg-background py-1 pr-2 pl-2.5 text-column text-foreground"
             onClick={() => onRemove(selection.signalName)}
             type="button"
           >
             <span aria-hidden="true" className="rounded-0.5 size-2" style={{ backgroundColor: color }} />
-            {selectionLabel(selection)}
+            {selectionLabel(signalCatalog, selection)}
             <X aria-hidden="true" className="size-3.5" />
           </button>
         );
       })}
-      <span className="text-neutral4 text-xs">
+      <Txt as="span" variant="caption" tone="muted">
         {filterSummary({ selections, filteredTraceCount, totalTraceCount, isUnavailable })}
-      </span>
+      </Txt>
       {!isUnavailable && filteredTraceCount !== undefined && latestSelection ? (
         <Button
+          icon={<Eye />}
           aria-label={
             latestSelection.kind === 'theme'
               ? `View theme details for ${latestSelection.label}`
-              : `View noise details for ${formatSignalName(latestSelection.signalName)}`
+              : `View noise details for ${signalLabel(signalCatalog, latestSelection.signalName)}`
           }
           onClick={() => onViewDetails(latestSelection)}
           size="sm"
@@ -101,7 +105,7 @@ export function ThemeFilterBanner({
         </Button>
       ) : null}
       {selections.length > 1 ? (
-        <Button onClick={onClear} size="sm" type="button" variant="ghost">
+        <Button icon={<X />} onClick={onClear} size="sm" type="button" variant="ghost">
           Clear all
         </Button>
       ) : null}

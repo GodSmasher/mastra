@@ -9,6 +9,21 @@ import { RequestContext } from '../../request-context';
 import type { WorkspaceFilesystem } from '../filesystem/filesystem';
 import { IsolationUnavailableError } from './errors';
 import { LocalSandbox, getMarkerDir } from './local-sandbox';
+
+const cpHook = vi.hoisted(() => ({
+  afterCopy: undefined as ((src: unknown, dest: unknown) => Promise<void>) | undefined,
+}));
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    cp: async (...args: Parameters<typeof actual.cp>) => {
+      await actual.cp(...args);
+      await cpHook.afterCopy?.(args[0], args[1]);
+    },
+  };
+});
+import type { MastraSandbox } from './mastra-sandbox';
 import {
   detectIsolation,
   isIsolationAvailable,
@@ -45,6 +60,134 @@ function makeMockLocalFs(basePath: string, overrides: Partial<WorkspaceFilesyste
 function activeSeatbeltProfile(sandbox: LocalSandbox): string {
   return sandbox.wrapCommandForIsolation('echo hi').args[1]!;
 }
+
+describe('LocalSandbox explicit sh argv', () => {
+  it('preserves operators, positional arguments, cwd, env and streamed output', async context => {
+    const configuredShell = process.env.MASTRA_TEST_GIT_SH;
+    const shell =
+      process.platform === 'win32'
+        ? (configuredShell ?? path.join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'bin', 'sh.exe'))
+        : 'sh';
+    if (process.platform === 'win32') {
+      try {
+        await fs.access(shell);
+      } catch (error) {
+        if (configuredShell || !(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
+          throw error;
+        }
+        context.skip('Git for Windows is not installed at the default path; set MASTRA_TEST_GIT_SH to its bin/sh.exe');
+        return;
+      }
+    }
+    const workingDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'mastra argv test '));
+    const sandbox = new LocalSandbox({ workingDirectory, isolation: 'none' });
+    const stdout = vi.fn();
+    const stderr = vi.fn();
+    try {
+      if (process.platform === 'win32') {
+        const gitDirectory = path.dirname(path.dirname(shell));
+        sandbox.setEnv(env => ({
+          ...env,
+          PATH: [path.join(gitDirectory, 'bin'), path.join(gitDirectory, 'usr', 'bin'), process.env.PATH ?? ''].join(
+            path.delimiter,
+          ),
+        }));
+      }
+      sandbox.setEnv(env => ({ ...env, ARGV_TEST: 'sandbox' }));
+      const reproduction = await sandbox.executeCommand(shell, ['-c', 'printf "first" && printf " second"']);
+      expect(reproduction).toMatchObject({ success: true, exitCode: 0, stdout: 'first second', stderr: '' });
+      const result = await sandbox.executeCommand(
+        shell,
+        [
+          '-c',
+          'printf "first" && printf " second"; printf "%s" "$1" | cat > output.txt; printf "%s" "$ARGV_TEST" >&2',
+          'sh',
+          'a "quoted" value with % and \\ backslash',
+        ],
+        { env: { ARGV_TEST: 'call' }, onStdout: stdout, onStderr: stderr },
+      );
+      expect(result.success).toBe(true);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('first second');
+      expect(result.stderr).toBe('call');
+      expect(stdout).toHaveBeenCalled();
+      expect(stderr).toHaveBeenCalled();
+      expect(await fs.readFile(path.join(workingDirectory, 'output.txt'), 'utf8')).toBe(
+        'a "quoted" value with % and \\ backslash',
+      );
+      expect(await sandbox.processes.list()).toEqual([]);
+      const failure = await sandbox.executeCommand(shell, ['-c', 'exit 7']);
+      expect(failure.exitCode).toBe(7);
+    } finally {
+      await sandbox._destroy();
+      await fs.rm(workingDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('LocalSandbox outputEncoding', () => {
+  let tempDir: string;
+  const sandboxes: LocalSandbox[] = [];
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mastra-local-sandbox-enc-'));
+  });
+
+  afterEach(async () => {
+    await Promise.all(sandboxes.splice(0).map(s => s._destroy().catch(() => {})));
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const create = (outputEncoding?: string) => {
+    const s = new LocalSandbox({ workingDirectory: tempDir, env: process.env, outputEncoding });
+    sandboxes.push(s);
+    return s;
+  };
+
+  // GBK bytes for "中文" on stdout and "中" on stderr
+  const gbkScript =
+    'process.stdout.write(Buffer.from([0xd6,0xd0,0xce,0xc4]));process.stderr.write(Buffer.from([0xd6,0xd0]))';
+
+  it('decodes GBK output from executeCommand', async () => {
+    const result = await create('gbk').executeCommand(process.execPath, ['-e', gbkScript]);
+    expect(result.stdout).toBe('中文');
+    expect(result.stderr).toBe('中');
+  });
+
+  it('decodes GBK output from background processes', async () => {
+    const sandbox = create('gbk');
+    await sandbox._start();
+    const handle = await sandbox.processes!.spawn(`"${process.execPath}" -e "${gbkScript}"`);
+    const result = await handle.wait();
+    expect(result.stdout).toBe('中文');
+    expect(result.stderr).toBe('中');
+  });
+
+  it('decodes multi-byte characters split across chunks', async () => {
+    const script =
+      'process.stdout.write(Buffer.from([0xd6]));setTimeout(()=>process.stdout.write(Buffer.from([0xd0])),50)';
+    const result = await create('gbk').executeCommand(process.execPath, ['-e', script]);
+    expect(result.stdout).toBe('中');
+  });
+
+  it('preserves outputEncoding when cloned', async () => {
+    const clone = create('gbk').clone();
+    sandboxes.push(clone);
+    const result = await clone.executeCommand(process.execPath, ['-e', gbkScript]);
+    expect(result.stdout).toBe('中文');
+  });
+
+  it('defaults to UTF-8', async () => {
+    const result = await create().executeCommand(process.execPath, ['-e', gbkScript]);
+    expect(result.stdout).not.toBe('中文');
+    const utf8 = await create().executeCommand(process.execPath, ['-e', 'process.stdout.write("中文")']);
+    expect(utf8.stdout).toBe('中文');
+  });
+
+  it('rejects unsupported encodings at construction', () => {
+    expect(() => new LocalSandbox({ workingDirectory: tempDir, outputEncoding: 'not-an-encoding' })).toThrow();
+  });
+});
 
 describe('LocalSandbox', () => {
   let tempDir: string;
@@ -99,6 +242,14 @@ describe('LocalSandbox', () => {
     it('should expand ~ in working directory', () => {
       const customSandbox = new LocalSandbox({ workingDirectory: '~/my-sandbox' });
       expect(customSandbox.workingDirectory).toBe(path.join(os.homedir(), 'my-sandbox'));
+    });
+
+    it('exposes the expanded effective path through the base workingDirectory getter', () => {
+      const customSandbox = new LocalSandbox({ workingDirectory: '~/my-sandbox' });
+      // Read through the base type: the base field must carry the computed
+      // effective value, not the raw option.
+      const base: MastraSandbox = customSandbox;
+      expect(base.workingDirectory).toBe(path.join(os.homedir(), 'my-sandbox'));
     });
   });
 
@@ -185,6 +336,25 @@ describe('LocalSandbox', () => {
       expect(sandbox.status).toBe('stopped');
     });
 
+    it('should kill background processes on stop()', async () => {
+      if (os.platform() === 'win32') return; // Uses POSIX commands
+
+      await sandbox._start();
+      const handle = await sandbox.processes.spawn('sleep 30');
+      await expect(sandbox.processes.list()).resolves.toHaveLength(1);
+
+      await sandbox._stop();
+
+      expect(sandbox.status).toBe('stopped');
+      await expect(sandbox.processes.list()).resolves.toEqual([]);
+      // The OS process itself is gone, not just untracked. `pid` is the OS
+      // pid stringified for local sandboxes; signal 0 probes existence.
+      await vi.waitFor(() => expect(() => process.kill(Number(handle.pid), 0)).toThrow(), {
+        timeout: 2000,
+        interval: 25,
+      });
+    });
+
     it('should destroy successfully', async () => {
       await sandbox._start();
       await sandbox._destroy();
@@ -198,6 +368,73 @@ describe('LocalSandbox', () => {
       await sandbox._start();
 
       expect(await sandbox.isReady()).toBe(true);
+    });
+
+    it("reports outcome 'created' when the working directory did not exist", async () => {
+      const fresh = new LocalSandbox({ workingDirectory: path.join(tempDir, 'fresh') });
+
+      await expect(fresh._start()).resolves.toEqual({ outcome: 'created' });
+    });
+
+    it("reports outcome 'connected' when reattaching to an existing working directory", async () => {
+      // beforeEach pre-creates tempDir via mkdtemp, so this is a reattach.
+      await expect(sandbox._start()).resolves.toEqual({ outcome: 'connected' });
+
+      const again = new LocalSandbox({ workingDirectory: tempDir });
+      await expect(again._start()).resolves.toEqual({ outcome: 'connected' });
+    });
+
+    it('runs a once-per-directory setup through a fatal onStart hook branching on outcome', async () => {
+      const dir = path.join(tempDir, 'boot');
+      const setup = async ({
+        sandbox: sb,
+        outcome,
+      }: {
+        sandbox: WorkspaceSandbox;
+        outcome?: 'created' | 'connected';
+      }) => {
+        if (outcome === 'created') await sb.executeCommand!('touch setup-ran.txt');
+      };
+
+      const first = new LocalSandbox({ workingDirectory: dir, onStart: setup });
+      await first._start();
+      await expect(fs.stat(path.join(dir, 'setup-ran.txt'))).resolves.toBeDefined();
+
+      // A second instance reattaches (outcome: 'connected') → the hook skips setup.
+      await fs.rm(path.join(dir, 'setup-ran.txt'));
+      const second = new LocalSandbox({ workingDirectory: dir, onStart: setup });
+      await second._start();
+      await expect(fs.stat(path.join(dir, 'setup-ran.txt'))).rejects.toThrow();
+    });
+  });
+
+  // ===========================================================================
+  // env overlay (setEnv)
+  // ===========================================================================
+  describe('env overlay (setEnv)', () => {
+    it('makes setEnv values visible to real processes and supports rotation', async () => {
+      sandbox.setEnv(env => ({ ...env, DEMO_TOKEN: 'tok_first' }));
+      const first = await sandbox.executeCommand('printenv', ['DEMO_TOKEN']);
+      expect(first.stdout.trim()).toBe('tok_first');
+
+      sandbox.setEnv(env => ({ ...env, DEMO_TOKEN: 'tok_rotated' }));
+      const rotated = await sandbox.executeCommand('printenv', ['DEMO_TOKEN']);
+      expect(rotated.stdout.trim()).toBe('tok_rotated');
+    });
+  });
+
+  // ===========================================================================
+  // env overlay (setEnv)
+  // ===========================================================================
+  describe('env overlay (setEnv)', () => {
+    it('makes setEnv values visible to real processes and supports rotation', async () => {
+      sandbox.setEnv(env => ({ ...env, DEMO_TOKEN: 'tok_first' }));
+      const first = await sandbox.executeCommand('printenv', ['DEMO_TOKEN']);
+      expect(first.stdout.trim()).toBe('tok_first');
+
+      sandbox.setEnv(env => ({ ...env, DEMO_TOKEN: 'tok_rotated' }));
+      const rotated = await sandbox.executeCommand('printenv', ['DEMO_TOKEN']);
+      expect(rotated.stdout.trim()).toBe('tok_rotated');
     });
   });
 
@@ -304,6 +541,36 @@ describe('LocalSandbox', () => {
       expect(result.stdout.trim()).toBe('released');
       await expect(sandbox.processes!.list()).resolves.toEqual([]);
     });
+
+    it('should not hang when the command reads stdin', async () => {
+      if (os.platform() === 'win32') return; // Uses POSIX commands
+
+      // `cat` with no file arguments copies stdin, so it only exits once stdin
+      // reaches EOF. Commands run through executeCommand have nothing feeding
+      // their stdin, so if it were left as an open pipe this would block until
+      // the timeout instead of returning. A command that reads stdin — `rg` or
+      // `grep` with no path argument, a bare `read` — must exit, not hang.
+      const result = await sandbox.executeCommand('cat', [], { timeout: 10_000 });
+
+      expect(result.timedOut).not.toBe(true);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.executionTimeMs).toBeLessThan(5_000);
+    }, 15_000);
+
+    it('should not hang when a Node process reads stdin', async () => {
+      // Cross-platform variant: `node -e` reading stdin until EOF. Runs on
+      // Windows too since it doesn't depend on POSIX commands.
+      const result = await sandbox.executeCommand(
+        'node',
+        ['-e', 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0));'],
+        { timeout: 10_000 },
+      );
+
+      expect(result.timedOut).not.toBe(true);
+      expect(result.exitCode).toBe(0);
+      expect(result.executionTimeMs).toBeLessThan(5_000);
+    }, 15_000);
 
     it('should handle command failure', async () => {
       if (os.platform() === 'win32') return; // Uses POSIX commands
@@ -670,6 +937,29 @@ describe('LocalSandbox', () => {
       ).toThrow(IsolationUnavailableError);
     });
 
+    it('should throw a clear error when seatbelt is requested on Windows', () => {
+      const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
+      try {
+        expect(
+          () =>
+            new LocalSandbox({
+              workingDirectory: tempDir,
+              isolation: 'seatbelt',
+            }),
+        ).toThrowError(
+          expect.objectContaining({
+            name: 'IsolationUnavailableError',
+            code: 'ISOLATION_UNAVAILABLE',
+            backend: 'seatbelt',
+            reason: 'Seatbelt isolation is only supported on macOS, not Windows.',
+          }),
+        );
+      } finally {
+        platformSpy.mockRestore();
+      }
+    });
+
     it('should include isolation in getInfo', async () => {
       await sandbox._start();
       const info = await sandbox.getInfo();
@@ -756,6 +1046,50 @@ describe('LocalSandbox', () => {
         expect(profileFalse).toContain(`(allow file-write* (subpath "${workspacePath}"))`);
       });
     });
+
+    describe('device nodes', () => {
+      const STANDARD_DEVICES = ['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom', '/dev/tty'];
+
+      it('mounts a fresh /dev so device nodes exist inside the bwrap namespace', () => {
+        const { args } = buildBwrapCommand('echo 1', '/path/to/workspace', {});
+
+        const devIndex = args.indexOf('--dev');
+        expect(devIndex).toBeGreaterThanOrEqual(0);
+        expect(args[devIndex + 1]).toBe('/dev');
+      });
+
+      it('emits --dev /dev after caller-supplied binds so /dev paths cannot shadow it', () => {
+        // readOnlyPaths: ['/dev'] is the workaround users applied for the missing
+        // /dev bug. Binds of /dev are mounted nodev, so if the bind came after
+        // --dev it would shadow the device mount and opening /dev/null O_RDWR
+        // would fail with EACCES. --dev must be the last /dev mount emitted.
+        for (const config of [
+          { readOnlyPaths: ['/dev'] },
+          { readOnlyPaths: ['/dev/null'] },
+          { readWritePaths: ['/dev'] },
+        ]) {
+          const { args } = buildBwrapCommand('echo 1', '/path/to/workspace', config);
+          const devIndex = args.indexOf('--dev');
+          const bindPath = (config.readOnlyPaths ?? config.readWritePaths)![0]!;
+          const bindIndex = args.indexOf(bindPath);
+          expect(devIndex).toBeGreaterThanOrEqual(0);
+          expect(bindIndex).toBeGreaterThanOrEqual(0);
+          expect(devIndex).toBeGreaterThan(bindIndex);
+        }
+      });
+
+      it('allows writes to standard device nodes in the seatbelt profile', () => {
+        // `file-ioctl` alone is not enough for opening devices O_RDWR; without
+        // `file-write-data` the default-deny profile rejects the open.
+        for (const config of [{}, { readOnly: true }]) {
+          const profile = generateSeatbeltProfile('/path/to/workspace', config);
+          for (const device of STANDARD_DEVICES) {
+            expect(profile).toContain(`(allow file-ioctl (literal "${device}"))`);
+            expect(profile).toContain(`(allow file-write-data (literal "${device}"))`);
+          }
+        }
+      });
+    });
   });
 
   // ===========================================================================
@@ -820,6 +1154,25 @@ describe('LocalSandbox', () => {
       const result = await seatbeltSandbox.executeCommand('echo', ['Hello from sandbox']);
       expect(result.success).toBe(true);
       expect(result.stdout.trim()).toBe('Hello from sandbox');
+
+      await seatbeltSandbox._destroy();
+    });
+
+    it('should allow shell redirection to /dev/null', async () => {
+      if (os.platform() !== 'darwin') {
+        return;
+      }
+
+      const seatbeltSandbox = new LocalSandbox({
+        workingDirectory: tempDir,
+        isolation: 'seatbelt',
+      });
+
+      await seatbeltSandbox._start();
+
+      const result = await seatbeltSandbox.executeCommand('sh', ['-c', 'printf x > /dev/null']);
+      expect(result.stderr).toBe('');
+      expect(result.success).toBe(true);
 
       await seatbeltSandbox._destroy();
     });
@@ -1273,6 +1626,49 @@ describe('LocalSandbox', () => {
       const result = await bwrapSandbox.executeCommand('echo', ['Hello from bwrap']);
       expect(result.success).toBe(true);
       expect(result.stdout.trim()).toBe('Hello from bwrap');
+
+      await bwrapSandbox._destroy();
+    });
+
+    it('should allow shell redirection to /dev/null', async () => {
+      if (os.platform() !== 'linux' || !isBwrapAvailable()) {
+        return;
+      }
+
+      const bwrapSandbox = new LocalSandbox({
+        workingDirectory: tempDir,
+        isolation: 'bwrap',
+      });
+
+      await bwrapSandbox._start();
+
+      const result = await bwrapSandbox.executeCommand('sh', ['-c', 'printf x > /dev/null']);
+      expect(result.stderr).toBe('');
+      expect(result.success).toBe(true);
+
+      await bwrapSandbox._destroy();
+    });
+
+    it('should allow shell redirection to /dev/null when readOnlyPaths includes /dev/null', async () => {
+      if (os.platform() !== 'linux' || !isBwrapAvailable()) {
+        return;
+      }
+
+      // Users worked around the missing /dev by binding it themselves; that
+      // bind is nodev and must not shadow the fresh --dev mount.
+      const bwrapSandbox = new LocalSandbox({
+        workingDirectory: tempDir,
+        isolation: 'bwrap',
+        nativeSandbox: {
+          readOnlyPaths: ['/dev/null'],
+        },
+      });
+
+      await bwrapSandbox._start();
+
+      const result = await bwrapSandbox.executeCommand('sh', ['-c', 'printf x > /dev/null']);
+      expect(result.stderr).toBe('');
+      expect(result.success).toBe(true);
 
       await bwrapSandbox._destroy();
     });
@@ -1930,6 +2326,38 @@ describe('LocalSandbox', () => {
       await restore;
 
       expect(await fs.readFile(path.join(otherDir, 'data.txt'), 'utf-8')).toBe('v2');
+    });
+
+    it('re-seeds when the checkpoint is replaced while it is being copied', async () => {
+      const sb = makeSandbox({ checkpointName: 'repo-abc' });
+      await sb.start();
+      await fs.writeFile(path.join(workDir, 'a.txt'), 'v1-a');
+      await fs.writeFile(path.join(workDir, 'b.txt'), 'v1-b');
+      await sb.snapshot();
+
+      // Swap in v2 right after the reader's first copy completes, as a
+      // concurrent snapshot() finishing mid-seed would. Content mixing depends
+      // on fs.cp's internal timing, so the swap-after-copy is what's asserted.
+      await fs.writeFile(path.join(workDir, 'b.txt'), 'v2-b');
+      await fs.writeFile(path.join(workDir, 'c.txt'), 'v2-c');
+      let swapped = false;
+      cpHook.afterCopy = async (src, dest) => {
+        if (swapped || !String(src).endsWith(path.join('.checkpoints', 'repo-abc'))) return;
+        swapped = true;
+        await fs.writeFile(path.join(String(dest), 'b.txt'), 'v2-b'); // mixed state
+        await sb.snapshot();
+      };
+
+      const otherDir = path.join(tempDir, 'work-mid-copy');
+      const reader = makeSandbox({ checkpointName: 'repo-abc', workingDirectory: otherDir });
+      try {
+        await reader.start();
+      } finally {
+        cpHook.afterCopy = undefined;
+      }
+
+      expect((await fs.readdir(otherDir)).sort()).toEqual(['a.txt', 'b.txt', 'c.txt']);
+      expect(await fs.readFile(path.join(otherDir, 'b.txt'), 'utf-8')).toBe('v2-b');
     });
 
     it('re-snapshot atomically replaces the previous checkpoint', async () => {

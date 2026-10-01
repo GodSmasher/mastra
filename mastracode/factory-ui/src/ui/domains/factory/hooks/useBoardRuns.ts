@@ -1,56 +1,39 @@
 import { toast } from '@mastra/playground-ui/components/Toaster';
-import { useMemo, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 
 import { useStartFactoryRun } from '../../../../hooks/useStartFactoryRun';
-import type { FactoryRunPhase } from '../../../../hooks/useStartFactoryRun';
+import { useIntakeConfigQuery } from '../../../../hooks/useIntakeConfig';
 import type { useWorkItemsQuery } from '../../../../hooks/useWorkItems';
-import { useWorkspacesQuery } from '../../../../hooks/useWorkspaces';
-import type { BoardCandidate } from '../boardCandidates';
-import { itemThreadSession, liveSessions } from '../boardItems';
-import { itemRunSpec, itemSessionSpec } from '../boardRunSpecs';
-import type { RunAction } from '../boardRunSpecs';
-import { inferredParentWorkItemId } from '../services/relationships';
+import { itemSessionSpec, itemThreadSession } from '../boardItems';
+import type { LinkedRepositoryPayload } from '../../workspaces/services/github';
 import type { WorkItem, WorkItemSessionRef } from '../services/workItems';
 
-const EMPTY_PENDING_ROLES: ReadonlyMap<string, FactoryRunPhase | undefined> = new Map();
-
-type PendingRoles = ReadonlyMap<string, FactoryRunPhase | undefined>;
-
-/** Starting agent runs from cards and candidates, and reopening the threads they left behind. */
+/** Opening the chat session a card carries, and minting one when it has none yet. */
 export function useBoardRuns({
   factoryProjectId,
-  projectRepositoryId,
-  workItems,
   refetchItems,
 }: {
   factoryProjectId: string;
-  projectRepositoryId: string | undefined;
-  workItems: readonly WorkItem[];
   refetchItems: ReturnType<typeof useWorkItemsQuery>['refetch'];
 }) {
-  const { start, pendingRuns, enabled } = useStartFactoryRun();
+  const { start, enabled, repositories } = useStartFactoryRun();
+  const intakeConfig = useIntakeConfigQuery();
   const navigate = useNavigate();
+  const [repositorySelection, setRepositorySelection] = useState<{
+    item: WorkItem;
+    branch: string;
+    threadTitle: string;
+  }>();
 
-  // Workspaces that still exist. A card's session ref whose workspace was
-  // deleted is stale: its thread is gone (workspace deletion cascades onto its
-  // threads), so it neither renders a Thread link nor blocks re-running.
-  const workspaces = useWorkspacesQuery(projectRepositoryId);
-  const liveWorktreePaths = useMemo(
-    () => new Set((workspaces.data?.workspaces ?? []).map(workspace => workspace.sessionId)),
-    [workspaces.data],
-  );
-
-  // A card click refetches worktrees and items before it can decide whether to
-  // open an existing thread or mint a new session. That wait is several round
-  // trips long and the run mutation isn't pending yet, so without this the card
-  // sits completely silent after the click.
+  // A card click refetches items before it can decide whether to open an
+  // existing thread or mint a new session. That wait is a round trip long and
+  // the mutation isn't pending yet, so without this the card sits completely
+  // silent after the click.
   const [preparingItems, setPreparingItems] = useState<Record<string, string>>({});
   // Guarded by a ref, not by preparingItems: two clicks landing in the same
   // render both read the pre-click state, so the state value can't reject the
-  // second one. Preparing is several round trips long and each pass mints its
-  // own kickoffKey, so the server's start lock keys differently per click and
-  // won't collapse them either.
+  // second one.
   const preparingRef = useRef<Set<string>>(new Set());
   const beginPreparingItem = (itemId: string, label: string) => {
     if (preparingRef.current.has(itemId)) return false;
@@ -73,10 +56,10 @@ export function useBoardRuns({
 
   // Refetch failures here used to be silent: an expired auth cookie made every
   // board click a no-op with no feedback. Toast so the click never dies quietly.
-  const refreshItemAndWorktrees = async (itemId: string) => {
-    const [refreshedWorkspaces, refreshedItems] = await Promise.all([workspaces.refetch(), refetchItems()]);
-    if (!refreshedWorkspaces.isSuccess || !refreshedItems.isSuccess) {
-      const cause = refreshedWorkspaces.error ?? refreshedItems.error;
+  const refreshItem = async (itemId: string) => {
+    const refreshedItems = await refetchItems();
+    if (!refreshedItems.isSuccess) {
+      const cause = refreshedItems.error;
       toast.error(cause instanceof Error ? cause.message : 'Failed to refresh the board — try reloading the page');
       return;
     }
@@ -85,33 +68,47 @@ export function useBoardRuns({
       toast.error('This card no longer exists — the board may be out of date');
       return;
     }
-    return {
-      item,
-      paths: new Set(refreshedWorkspaces.data.workspaces.map(workspace => workspace.sessionId)),
-    };
+    return item;
   };
 
-  const openOrCreateSession = async (item: WorkItem, destinationStage: string) => {
+  const openOrCreateSession = async (item: WorkItem) => {
     if (!beginPreparingItem(item.id, 'Preparing session…')) return;
     try {
-      const refreshed = await refreshItemAndWorktrees(item.id);
+      const refreshed = await refreshItem(item.id);
       if (!refreshed) return;
-      const existingSession = itemThreadSession(liveSessions(refreshed.item.sessions, refreshed.paths));
+      const existingSession = itemThreadSession(refreshed.sessions);
       if (existingSession) {
         await openThread(existingSession);
         return;
       }
-      const spec = itemSessionSpec(refreshed.item);
+      const spec = itemSessionSpec(refreshed);
+      const linearProjectId =
+        refreshed.source === 'linear-issue' && typeof refreshed.metadata.linearProjectId === 'string'
+          ? refreshed.metadata.linearProjectId
+          : undefined;
+      const config = linearProjectId && !intakeConfig.data ? (await intakeConfig.refetch()).data : intakeConfig.data;
+      const mappedSlug = linearProjectId ? config?.linear.repositoryByLinearProject?.[linearProjectId] : undefined;
+      const targetSlug =
+        (typeof refreshed.metadata.repository === 'string' ? refreshed.metadata.repository : undefined) ?? mappedSlug;
+      const hasLinkedTarget = targetSlug ? repositories.some(repository => repository.slug === targetSlug) : false;
+      if (!targetSlug && repositories.length > 1) {
+        setRepositorySelection({ item: refreshed, ...spec });
+        return 'repository-selection-required' as const;
+      }
+      if (targetSlug && !hasLinkedTarget) {
+        toast.error(`Repository ${targetSlug} is not linked to this Factory`);
+        return;
+      }
       await start.mutateAsync({
         branch: spec.branch,
         threadTitle: spec.threadTitle,
         workItem: {
-          id: refreshed.item.id,
+          id: refreshed.id,
           role: 'chat',
-          stages: [destinationStage],
-          source: refreshed.item.source,
-          sourceKey: refreshed.item.sourceKey,
-          title: refreshed.item.title,
+          source: refreshed.source,
+          sourceKey: refreshed.sourceKey,
+          title: refreshed.title,
+          metadata: refreshed.metadata,
         },
       });
     } finally {
@@ -119,123 +116,39 @@ export function useBoardRuns({
     }
   };
 
-  const openOrStartRun = async (item: WorkItem, role: RunAction['role']) => {
-    if (!beginPreparingItem(item.id, 'Preparing run…')) return;
-    try {
-      await startRunForItem(item, role, { openExisting: true });
-    } finally {
-      clearPreparingItem(item.id);
-    }
-  };
-
-  // Re-run a role's agent even though the card already has a live session for
-  // it — e.g. re-reviewing a Done-lane PR that got new commits. All of an
-  // item's runs share one branch/worktree, so the kickoff lands in the
-  // existing thread as a follow-up instead of minting a parallel session.
-  const restartRun = async (item: WorkItem, role: RunAction['role']) => {
-    if (!beginPreparingItem(item.id, 'Preparing run…')) return;
-    try {
-      await startRunForItem(item, role, { openExisting: false });
-    } finally {
-      clearPreparingItem(item.id);
-    }
-  };
-
-  const startRunForItem = async (
-    item: WorkItem,
-    role: RunAction['role'],
-    { openExisting }: { openExisting: boolean },
-  ) => {
-    const refreshed = await refreshItemAndWorktrees(item.id);
-    if (!refreshed) return;
-    const existingSession = refreshed.item.sessions[role];
-    if (openExisting && existingSession && refreshed.paths.has(existingSession.sessionId)) {
-      await openThread(existingSession);
-      return;
-    }
-    const spec = itemRunSpec(refreshed.item);
-    const action = spec?.actions.find(candidate => candidate.role === role);
-    if (!spec || !action) {
-      toast.error(`This card can't start a ${role} run from its current state`);
-      return;
-    }
-    await start.mutateAsync({
-      branch: spec.branch,
-      threadTitle: spec.threadTitle,
-      threadTags: action.threadTags,
-      invocation: action.invocation,
-      workItem: {
-        id: refreshed.item.id,
-        role: action.role,
-        existingRoles: Object.keys(refreshed.item.sessions),
-        stages: [action.stage],
-        source: refreshed.item.source,
-        sourceKey: refreshed.item.sourceKey,
-        title: refreshed.item.title,
-      },
-    });
-  };
-
-  const startCandidateRun = async (candidate: BoardCandidate, action: RunAction, prompt?: string) => {
-    if (!beginPreparingItem(candidate.sourceKey, 'Starting run…')) return;
+  const selectRepository = async (repository: LinkedRepositoryPayload) => {
+    if (!repositorySelection) return;
+    const { item, branch, threadTitle } = repositorySelection;
+    setRepositorySelection(undefined);
     try {
       await start.mutateAsync({
-        branch: candidate.branch,
-        threadTitle: candidate.threadTitle,
-        threadTags: action.threadTags,
-        invocation:
-          prompt === undefined ? action.invocation : { type: 'prompt', prompt: candidate.customPrompt(prompt) },
+        branch,
+        threadTitle,
+        repositorySlug: repository.slug,
         workItem: {
-          role: action.role,
-          stages: [action.stage],
-          source: candidate.source,
-          sourceKey: candidate.sourceKey,
-          parentWorkItemId:
-            candidate.source === 'github-pr' ? inferredParentWorkItemId(candidate.metadata, workItems) : undefined,
-          title: candidate.title,
-          url: candidate.url,
-          metadata: candidate.metadata,
+          id: item.id,
+          role: 'chat',
+          source: item.source,
+          sourceKey: item.sourceKey,
+          title: item.title,
+          metadata: item.metadata,
         },
       });
-    } finally {
-      clearPreparingItem(candidate.sourceKey);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to start the run');
     }
   };
-
-  const pendingByItem = new Map<string, Map<string, FactoryRunPhase | undefined>>();
-  const pendingBySource = new Map<string, Map<string, FactoryRunPhase | undefined>>();
-  for (const run of pendingRuns) {
-    if (run.id !== undefined) addPendingRun(pendingByItem, run.id, run.role, run.phase);
-    if (run.sourceKey !== null) addPendingRun(pendingBySource, run.sourceKey, run.role, run.phase);
-  }
 
   return {
     enabled,
-    // Until the worktree listing settles, liveness is unknown and every session
-    // ref looks stale — a card title would render as a create button and a click
-    // would mint a replacement session for a perfectly live thread.
-    disabled: !enabled || !workspaces.isSuccess,
-    sessionLivenessResolved: workspaces.isSuccess,
-    liveWorktreePaths,
     error: start.error,
-    pendingRolesFor: (itemId: string): PendingRoles => pendingByItem.get(itemId) ?? EMPTY_PENDING_ROLES,
+    repositories,
+    repositorySelection,
+    selectRepository,
+    closeRepositorySelection: () => setRepositorySelection(undefined),
     preparingFor: (itemId: string): string | undefined => preparingItems[itemId],
-    pendingRolesForSource: (sourceKey: string): PendingRoles => pendingBySource.get(sourceKey) ?? EMPTY_PENDING_ROLES,
-    preparingForSource: (sourceKey: string): string | undefined => preparingItems[sourceKey],
+    openThread,
+    refreshItem,
     openOrCreateSession,
-    openOrStartRun,
-    restartRun,
-    startCandidateRun,
   };
-}
-
-function addPendingRun(
-  target: Map<string, Map<string, FactoryRunPhase | undefined>>,
-  key: string,
-  role: string,
-  phase: FactoryRunPhase | undefined,
-) {
-  const roles = target.get(key);
-  if (roles) roles.set(role, phase);
-  else target.set(key, new Map([[role, phase]]));
 }

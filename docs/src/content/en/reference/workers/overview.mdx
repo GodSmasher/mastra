@@ -1,6 +1,6 @@
 ---
 title: "Reference: Workers | Workers"
-description: "API reference for Mastra workers, the background processing units that handle workflow orchestration, cron scheduling, and background task execution."
+description: "Use Mastra workers as background processing units for workflow orchestration, cron scheduling, durable execution, and asynchronous tasks."
 packages:
   - "@mastra/core"
   - "@mastra/redis-streams"
@@ -33,6 +33,8 @@ Controls which workers start in the current process.
 | `"orchestration,scheduler"` | Multiple workers (comma-separated) |
 
 Use this to run different worker types in separate containers from the same build artifact.
+
+Setting `MASTRA_WORKERS` to any value, including `"false"`, also makes `createWorkflow` build workflows that declare `schedule` on the evented engine. Set it on every process in a split deployment. See [Scheduled workflows](/docs/workflows/scheduled-workflows#execution-engine).
 
 ### `MASTRA_STEP_EXECUTION_URL`
 
@@ -70,7 +72,7 @@ Processes workflow events from the PubSub `workflows` topic. Requires a pull-cap
 
 ### SchedulerWorker
 
-Polls storage for due cron schedules and publishes `workflow.start` events.
+Polls storage for due cron schedules and publishes a `workflow.start` event to the `workflows` topic for each fire. The orchestration worker runs default-engine workflows in-process and evented workflows step by step.
 
 - **Name**: `scheduler`
 - **Single instance only**: Run exactly one instance to avoid duplicate fires

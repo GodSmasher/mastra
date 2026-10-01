@@ -15,7 +15,7 @@ import { describe, expect, it, onTestFinished } from 'vitest';
 import { server } from '../../../../../../e2e/ui/msw-server';
 import { TEST_BASE_URL, renderWithProviders, waitForMutationsIdle } from '../../../../../../e2e/ui/render';
 import { ChatSessionContext } from '../../../chat/context/ChatSessionContext';
-import type { FactoryUserSession } from '../../services/github';
+import type { FactoryUserSession } from '../../services/user-sessions';
 import { WorkspacesSection } from '../WorkspacesSection';
 
 const projectRepositoryId = 'ghp-1';
@@ -42,14 +42,11 @@ function renderSection() {
     <MemoryRouter initialEntries={['/factories/fp-1']}>
       <ChatSessionContext.Provider
         value={{
-          // Enabled: the sidebar holds a live controller session here, which is
-          // exactly the state in which the old cascade had something to delete.
           resourceId: 'resource-1',
           sessionEnabled: true,
           resourceReady: true,
           sandboxReady: true,
           sandboxPreparing: false,
-          sandboxProgress: undefined,
           resourceEnabled: true,
           factorySessionState: { factoryProjectId: 'fp-1', projectRepositoryId },
           baseUrl: TEST_BASE_URL,
@@ -71,7 +68,7 @@ describe('Deleting a workspace', () => {
     const threadRequests: string[] = [];
 
     server.use(
-      http.get(`${TEST_BASE_URL}/web/github/projects/${projectRepositoryId}/sessions`, () =>
+      http.get(`${TEST_BASE_URL}/web/source-control/projects/${projectRepositoryId}/sessions`, () =>
         HttpResponse.json({ sessions }),
       ),
       http.get(`${TEST_BASE_URL}/web/factory/projects/fp-1/work-items`, () => HttpResponse.json({ items: [] })),
@@ -82,9 +79,6 @@ describe('Deleting a workspace', () => {
       }),
     );
 
-    // Watch the raw network instead of a handler: any touch of the thread store
-    // at all — enumerating them to cascade, or deleting one — is a failure here,
-    // whatever URL shape the controller client happens to use.
     const recordThreadRequest = ({ request }: { request: Request }) => {
       const { pathname } = new URL(request.url);
       if (pathname.includes('/threads')) threadRequests.push(`${request.method} ${pathname}`);
@@ -99,13 +93,11 @@ describe('Deleting a workspace', () => {
     await user.click(within(group).getByRole('button', { name: 'Session actions for factory/pr-20474' }));
     await user.click(await screen.findByRole('menuitem', { name: 'Delete' }));
 
-    const dialog = await screen.findByRole('dialog');
+    const dialog = await screen.findByRole('alertdialog');
     expect(within(dialog).getByText(/Threads from this workspace are kept/)).toBeInTheDocument();
     await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(deletedSessions).toEqual([sessionId]));
-    // Let the mutation's success-side cache work settle before asserting the
-    // thread store was never touched.
     await waitForMutationsIdle(client);
     expect(threadRequests).toEqual([]);
   });

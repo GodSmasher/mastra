@@ -407,15 +407,16 @@ export async function prepareMemoryStep({
         promises.push(
           routingAgent
             .genTitle(userMessage, requestContext, observabilityContext, titleModel, titleInstructions)
-            .then(title => {
-              if (title) {
-                return memory.createThread({
-                  threadId: thread.id,
-                  resourceId: thread.resourceId,
-                  memoryConfig,
-                  title,
-                  metadata: thread.metadata,
-                });
+            .then(async title => {
+              if (!title) return;
+              // Update-only: the thread may have been deleted while the title was generating (#25203).
+              if (!(await memory.getThreadById({ threadId: thread.id }))) return;
+              try {
+                await memory.updateThread({ id: thread.id, title, memoryConfig });
+              } catch (error) {
+                // A delete can still land between the check and the update; only swallow that case.
+                if (!(await memory.getThreadById({ threadId: thread.id }))) return;
+                throw error;
               }
             }),
         );
@@ -1603,13 +1604,15 @@ export async function createNetworkLoop({
       // requireApproval can be:
       // - boolean (from Mastra createTool or mapped from AI SDK needsApproval: true)
       // - undefined (no approval needed)
-      // If needsApprovalFn exists, evaluate it with the tool args
+      // If needsApprovalFn exists, evaluate it with the tool args and the same
+      // request-context view the agentic loop provides.
       let toolRequiresApproval = (tool as any).requireApproval;
       const needsApprovalFn = getNeedsApprovalFn(tool);
       if (needsApprovalFn) {
-        // Evaluate the function with the parsed args
         try {
-          const needsApprovalResult = await needsApprovalFn(inputDataToUse);
+          const needsApprovalResult = await needsApprovalFn(inputDataToUse, {
+            requestContext: Object.fromEntries(requestContext.entries()),
+          });
           toolRequiresApproval = needsApprovalResult;
         } catch (error) {
           // Log error to help developers debug faulty needsApprovalFn implementations
@@ -2022,6 +2025,9 @@ export async function createNetworkLoop({
     }),
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      // Excluding `running` means resume claims cannot persist; suppress the
+      // per-resume warning for this internal workflow.
+      allowUnclaimedResumes: true,
       // Agent-loop snapshots are pure resume artifacts — strip everything a
       // resume never reads before persisting.
       pruneSnapshot: pruneAgentLoopSnapshot,
@@ -2625,6 +2631,9 @@ export async function networkLoop<OUTPUT = undefined>({
     outputSchema: validationStep.outputSchema,
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      // Excluding `running` means resume claims cannot persist; suppress the
+      // per-resume warning for this internal workflow.
+      allowUnclaimedResumes: true,
       pruneSnapshot: pruneAgentLoopSnapshot,
       validateInputs: false,
       // Internal agent.network() plumbing — see networkWorkflow above.
@@ -2663,6 +2672,9 @@ export async function networkLoop<OUTPUT = undefined>({
     }),
     options: {
       shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      // Excluding `running` means resume claims cannot persist; suppress the
+      // per-resume warning for this internal workflow.
+      allowUnclaimedResumes: true,
       pruneSnapshot: pruneAgentLoopSnapshot,
       validateInputs: false,
       // Internal agent.network() plumbing — see networkWorkflow above.

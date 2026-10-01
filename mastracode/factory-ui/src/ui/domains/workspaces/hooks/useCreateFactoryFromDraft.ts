@@ -5,7 +5,7 @@ import { queryKeys } from '../../../../api/keys';
 import { useApplyProviderOMDefaults } from '../../../../hooks/use-om';
 import { useCreateFactoryMutation, useLinkRepositoryMutation } from '../../../../hooks/useFactories';
 import { useSaveIntakeBindingMutation, useSaveIntakeConfigMutation } from '../../../../hooks/useIntakeConfig';
-import { fetchIntakeConfig } from '../../factory/services/intake';
+import { fetchIntakeConfig, selectIntakeSource } from '../../factory/services/intake';
 import { updateFactoryDefaultModel } from '../services/github';
 import type { FactoryProjectPayload } from '../services/github';
 import type { CreateFactoryDraft } from './useCreateFactoryFlow';
@@ -19,10 +19,10 @@ export interface CreateFactoryFromDraftOptions {
 }
 
 /**
- * The wizard's single write: create the Factory, link the repository, route the
- * Linear project when one was picked, and save the model its runs start on.
- * Nothing before this touches the server, so an abandoned wizard leaves nothing
- * behind.
+ * The wizard's single write: create the Factory, link the repository (which
+ * feeds its issue intake), route the selected project-management source, and
+ * save the model its runs start on. Nothing before this touches the server, so
+ * an abandoned wizard leaves nothing behind.
  */
 export function useCreateFactoryFromDraft({
   draft,
@@ -38,15 +38,22 @@ export function useCreateFactoryFromDraft({
   const saveIntakeBinding = useSaveIntakeBindingMutation();
   const saveIntakeConfig = useSaveIntakeConfigMutation();
 
-  /** Route a Linear project to the new board, and turn its sync on if it was off. */
-  const feedBoardFromLinear = async (linearProjectId: string, factoryProjectId: string) => {
-    await saveIntakeBinding.mutateAsync({ integrationId: 'linear', sourceId: linearProjectId, factoryProjectId });
+  const feedProject = async (input: {
+    integrationId: 'linear' | 'jira';
+    sourceId: string;
+    factoryProjectId: string;
+  }) => {
+    await saveIntakeBinding.mutateAsync({
+      integrationId: input.integrationId,
+      sourceId: input.sourceId,
+      factoryProjectId: input.factoryProjectId,
+      // A fresh Factory only has its built-in boards; issues belong on Work.
+      board: 'work',
+    });
     const config = await fetchIntakeConfig(baseUrl);
-    const { enabled, sourceIds } = config.linear;
-    const nextSourceIds =
-      sourceIds === null || sourceIds.includes(linearProjectId) ? sourceIds : [...sourceIds, linearProjectId];
-    if (enabled && nextSourceIds === sourceIds) return;
-    await saveIntakeConfig.mutateAsync({ ...config, linear: { enabled: true, sourceIds: nextSourceIds } });
+    const selection = selectIntakeSource(config[input.integrationId], input.sourceId);
+    if (selection === config[input.integrationId]) return;
+    await saveIntakeConfig.mutateAsync({ ...config, [input.integrationId]: selection });
   };
 
   return useMutation({
@@ -66,7 +73,12 @@ export function useCreateFactoryFromDraft({
       await Promise.all([
         updateFactoryDefaultModel(baseUrl, factory.id, modelId),
         applyOMDefaults.mutateAsync({ providerId, factoryModelId: modelId, factoryId: factory.id }),
-        draft.linearProjectId && feedBoardFromLinear(draft.linearProjectId, factory.id),
+        draft.linearProjectId
+          ? feedProject({ integrationId: 'linear', sourceId: draft.linearProjectId, factoryProjectId: factory.id })
+          : undefined,
+        draft.jiraProjectId
+          ? feedProject({ integrationId: 'jira', sourceId: draft.jiraProjectId, factoryProjectId: factory.id })
+          : undefined,
       ]);
       await queryClient.invalidateQueries({ queryKey: queryKeys.factories() });
       await onCreated(factory);

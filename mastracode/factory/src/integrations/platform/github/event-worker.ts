@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import type { MountedMastraCode } from '@mastra/code-sdk';
 import { isLeaseProvider, NoopLeaseProvider } from '@mastra/core/events';
 import type { LeaseProvider, PubSub } from '@mastra/core/events';
@@ -23,7 +21,9 @@ import { PlatformApiError } from '../api-client.js';
 
 const API_PREFIX = '/v1/server/github-app';
 const DEFAULT_POLL_INTERVAL_MS = 20_000;
-const DEFAULT_RECONCILE_INTERVAL_MS = 5 * 60_000;
+// Event polling is the primary sync; the sweeps only catch drift (missed
+// events, cards ingested before polling was linked), so they run hourly.
+const DEFAULT_RECONCILE_INTERVAL_MS = 60 * 60_000;
 const EVENT_PAGE_SIZE = 500;
 const MIN_LEASE_TTL_MS = 30_000;
 const CURSOR_ORG_ID = '__platform_github_event_worker__';
@@ -90,8 +90,6 @@ export interface PlatformGithubEventWorkerConfig {
   ingestFactoryEvent?: (event: ParsedGithubWebhook) => Promise<unknown>;
   reconcileFactoryState?: GithubPullRequestReconciler;
   reconcileIssuesFactoryState?: GithubIssueReconciler;
-  /** Base-checkpoint freshness sweep, run after the reconcilers within the lease. */
-  sweepBaseCheckpoints?: () => Promise<void>;
   /** When false the worker skips event tailing and only runs enabled reconciliation sweeps. */
   pollEventsEnabled?: boolean;
   intervalMs?: number;
@@ -113,7 +111,6 @@ export class PlatformGithubEventWorker extends MastraWorker {
   readonly #ingestFactoryEvent: ((event: ParsedGithubWebhook) => Promise<unknown>) | undefined;
   readonly #reconcileFactoryState: GithubPullRequestReconciler | undefined;
   readonly #reconcileIssuesFactoryState: GithubIssueReconciler | undefined;
-  readonly #sweepBaseCheckpoints: (() => Promise<void>) | undefined;
   readonly #pollEventsEnabled: boolean;
   readonly #pullRequestReconcileIntervalMs: number;
   readonly #issueReconcileIntervalMs: number;
@@ -121,7 +118,7 @@ export class PlatformGithubEventWorker extends MastraWorker {
   readonly #now: () => number;
   readonly #dispatch: typeof dispatchGithubWebhook;
   readonly #sourceControl: GithubReconcileRepositorySource;
-  readonly #leaseOwner = randomUUID();
+  readonly #leaseOwner = globalThis.crypto.randomUUID();
 
   #running = false;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -131,8 +128,9 @@ export class PlatformGithubEventWorker extends MastraWorker {
   #leaseTtlMs: number;
   #hasLease = false;
   #startedAt = 0;
-  #lastPullRequestReconcileAt = 0;
-  #lastIssueReconcileAt = 0;
+  // Negative infinity so the first tick always sweeps, whatever the clock reads.
+  #lastPullRequestReconcileAt = Number.NEGATIVE_INFINITY;
+  #lastIssueReconcileAt = Number.NEGATIVE_INFINITY;
   #settings: PlatformGithubEventWorkerSettings = { version: 1, repositories: {} };
 
   constructor(config: PlatformGithubEventWorkerConfig) {
@@ -144,7 +142,6 @@ export class PlatformGithubEventWorker extends MastraWorker {
     this.#ingestFactoryEvent = config.ingestFactoryEvent;
     this.#reconcileFactoryState = config.reconcileFactoryState;
     this.#reconcileIssuesFactoryState = config.reconcileIssuesFactoryState;
-    this.#sweepBaseCheckpoints = config.sweepBaseCheckpoints;
     this.#pollEventsEnabled = config.pollEventsEnabled ?? true;
     const legacyReconcileIntervalMs = config.reconcileIntervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS;
     this.#pullRequestReconcileIntervalMs = config.pullRequestReconcileIntervalMs ?? legacyReconcileIntervalMs;
@@ -358,7 +355,12 @@ export class PlatformGithubEventWorker extends MastraWorker {
         const { errors, ...counts } = await this.#reconcileIssuesFactoryState(targets);
         const context = { ...counts, candidateRepositories: targets.length, durationMs: Date.now() - startedAt };
         if (counts.failed > 0) {
-          this.deps?.logger.warn('Platform GitHub issue reconcile sweep completed with failures', { ...context, errors });
+          this.deps?.logger.warn('Platform GitHub issue reconcile sweep completed with failures', {
+            ...context,
+            errors,
+          });
+        } else if (counts.created > 0) {
+          this.deps?.logger.info('Platform GitHub issue reconcile replayed missed opens', context);
         } else if (counts.closed > 0) {
           this.deps?.logger.info('Platform GitHub issue reconcile replayed closed work items', context);
         } else if (counts.updated > 0) {
@@ -370,16 +372,6 @@ export class PlatformGithubEventWorker extends MastraWorker {
         this.deps?.logger.error('Platform GitHub issue reconcile failed', {
           repositories: targets.length,
           durationMs: Date.now() - startedAt,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
-    if (this.#sweepBaseCheckpoints && this.#hasLease) {
-      try {
-        await this.#sweepBaseCheckpoints();
-      } catch (error) {
-        this.deps?.logger.warn('Platform GitHub base-checkpoint freshness sweep failed', {
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -462,6 +454,13 @@ export class PlatformGithubEventWorker extends MastraWorker {
         }
         if (isFactoryIngestedEvent(parsed)) {
           await this.#ingestFactoryEvent?.(parsed);
+        } else {
+          this.deps?.logger.debug('Platform GitHub event not forwarded to Factory ingress', {
+            repositoryId,
+            deliveryId: parsed.deliveryId,
+            event: parsed.event,
+            action: parsed.payload.action,
+          });
         }
         const result = await this.#dispatch(parsed, {
           controller: this.#controller,
@@ -583,6 +582,8 @@ function normalizeSettings(value: PlatformGithubEventWorkerSettings | null): Pla
 // parsed event; the platform path gates because the remaining events (issue
 // edits, comment edits and deletions) only interest the subscription
 // dispatcher, not the factory rules.
+const ISSUE_INGESTED_ACTIONS = new Set(['opened', 'reopened', 'edited', 'labeled', 'unlabeled']);
+
 function isFactoryIngestedEvent(event: ParsedGithubWebhook): boolean {
   if ((event.event === 'issues' || event.event === 'pull_request') && event.payload.action === 'closed') {
     return true;
@@ -594,6 +595,9 @@ function isFactoryIngestedEvent(event: ParsedGithubWebhook): boolean {
     // only path a local deployment has.
     if (action === 'opened' || action === 'synchronize' || action === 'review_requested') return true;
   }
+  // Issue opens, reopens, edits and label changes mint and update Work cards.
+  // Without them a new issue never becomes a card on the polling path (#24972).
+  if (event.event === 'issues' && ISSUE_INGESTED_ACTIONS.has(String(event.payload.action))) return true;
   if (event.event === 'pull_request_review' && event.payload.action === 'submitted') return true;
   if (event.event === 'issue_comment' && event.payload.action === 'created') return true;
   // Default-branch pushes drive base-checkpoint rebuilds

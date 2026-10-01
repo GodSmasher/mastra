@@ -91,12 +91,16 @@ function createWorker(input: {
           repositoryExternalId: String(row.repositoryId),
         })),
       ),
-      listByExternalRepository: vi.fn(async (args: { installationExternalId: string; repositoryExternalId: string }) => {
-        const match = configured.find(
-          row => String(row.installationId) === args.installationExternalId && String(row.repositoryId) === args.repositoryExternalId,
-        );
-        return match ? [{ orgId: match.orgId ?? 'org-1', factoryProjectId: 'proj-1' }] : [];
-      }),
+      listByExternalRepository: vi.fn(
+        async (args: { installationExternalId: string; repositoryExternalId: string }) => {
+          const match = configured.find(
+            row =>
+              String(row.installationId) === args.installationExternalId &&
+              String(row.repositoryId) === args.repositoryExternalId,
+          );
+          return match ? [{ orgId: match.orgId ?? 'org-1', factoryProjectId: 'proj-1' }] : [];
+        },
+      ),
     },
     repositories: {
       findByExternalId: vi.fn(async (args: { orgId: string; externalId: string }) => {
@@ -211,6 +215,11 @@ describe('PlatformGithubEventWorker', () => {
     await worker.start();
     await vi.advanceTimersByTimeAsync(0);
 
+    const parsedIssueOpened = {
+      event: 'issues',
+      deliveryId: 'delivery-opened',
+      payload: { action: 'opened' },
+    };
     const parsedPullRequestOpened = {
       event: 'pull_request',
       deliveryId: 'delivery-pr-opened',
@@ -244,15 +253,16 @@ describe('PlatformGithubEventWorker', () => {
     });
     // A pull request being opened is what mints its Review card, so it has to
     // reach the rules engine; synchronize and review_requested feed the
-    // re-review path, and closed feeds the reconciler. An opened *issue* is
-    // deliberately absent — the factory picks new issues up via the reconciler.
+    // re-review path, and closed feeds the reconciler. An opened issue mints
+    // its Work card the same way, so it has to reach the rules engine too.
     // Pushes feed the base-checkpoint trigger wrapped around the ingest.
-    expect(ingestFactoryEvent).toHaveBeenCalledTimes(5);
-    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(1, parsedPullRequestOpened);
-    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(2, parsedSynchronize);
-    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(3, parsedReviewRequested);
-    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(4, parsedClosed);
-    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(5, parsedPush);
+    expect(ingestFactoryEvent).toHaveBeenCalledTimes(6);
+    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(1, parsedIssueOpened);
+    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(2, parsedPullRequestOpened);
+    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(3, parsedSynchronize);
+    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(4, parsedReviewRequested);
+    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(5, parsedClosed);
+    expect(ingestFactoryEvent).toHaveBeenNthCalledWith(6, parsedPush);
     expect(dispatch).toHaveBeenCalledTimes(6);
     expect(dispatch).toHaveBeenNthCalledWith(
       1,
@@ -287,7 +297,7 @@ describe('PlatformGithubEventWorker', () => {
     await resumed.stop();
   });
 
-  it('hands review feedback to the factory rules so the authoring agent is woken', async () => {
+  it('forwards created PR comments to Factory rules but never retriggers from edits', async () => {
     const settings = createSettingsStorage();
     const dispatch = vi.fn<typeof dispatchGithubWebhook>().mockResolvedValue({
       delivered: 1,
@@ -929,6 +939,66 @@ describe('PlatformGithubEventWorker', () => {
     expect(reconcileIssuesFactoryState).toHaveBeenCalledTimes(4);
   });
 
+  it('sweeps once on the first tick and then hourly by default', async () => {
+    const settings = createSettingsStorage();
+    const fetchImpl = vi.fn<typeof fetch>(async input => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/installations')) {
+        return json({ installations: [{ installationId: 7, usable: true, suspendedAt: null }] });
+      }
+      if (url.pathname.endsWith('/installations/7/repositories')) {
+        return json({ repositories: [{ id: 101, fullName: 'acme/repo' }] });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    let clock = 1_000_000;
+    const reconcileFactoryState = vi.fn<GithubPullRequestReconciler>(async () => ({
+      repositories: 1,
+      checked: 1,
+      merged: 0,
+      closed: 0,
+      failed: 0,
+      errors: [],
+    }));
+    const reconcileIssuesFactoryState = vi.fn<GithubIssueReconciler>(async () => ({
+      repositories: 1,
+      checked: 1,
+      updated: 0,
+      closed: 0,
+      failed: 0,
+      errors: [],
+    }));
+    const worker = createWorker({
+      fetchImpl,
+      storage: settings.storage,
+      now: () => clock,
+      reconcileFactoryState,
+      reconcileIssuesFactoryState,
+      intervalMs: 5 * 60_000,
+      pollEventsEnabled: false,
+    });
+
+    await worker.init(createDeps());
+    await worker.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reconcileFactoryState).toHaveBeenCalledTimes(1);
+    expect(reconcileIssuesFactoryState).toHaveBeenCalledTimes(1);
+
+    // Eleven more five-minute ticks stay inside the hour: no second sweep.
+    for (let tick = 0; tick < 11; tick += 1) {
+      clock += 5 * 60_000;
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+    }
+    expect(reconcileFactoryState).toHaveBeenCalledTimes(1);
+    expect(reconcileIssuesFactoryState).toHaveBeenCalledTimes(1);
+
+    clock += 5 * 60_000;
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await worker.stop();
+    expect(reconcileFactoryState).toHaveBeenCalledTimes(2);
+    expect(reconcileIssuesFactoryState).toHaveBeenCalledTimes(2);
+  });
+
   it('reconciles without tailing events when event polling is disabled', async () => {
     const settings = createSettingsStorage();
     const dispatch = vi.fn<typeof dispatchGithubWebhook>();
@@ -1022,9 +1092,7 @@ describe('PlatformGithubEventWorker', () => {
         if (url.pathname.endsWith('/repositories/101/events')) {
           if (url.searchParams.has('afterTimestamp')) {
             return json({
-              events: [
-                { id: '1000-0', deliveryId: 'delivery-1', event: 'issues', payload: { action: 'opened' } },
-              ],
+              events: [{ id: '1000-0', deliveryId: 'delivery-1', event: 'issues', payload: { action: 'opened' } }],
               nextCursor: '1000-0',
             });
           }

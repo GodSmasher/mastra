@@ -115,9 +115,11 @@ function createState(isRunning: boolean) {
       allSlashCommandComponents: [],
       allSystemReminderComponents: [],
       allShellComponents: [],
+      chatContainer: { children: [] },
       ui: { requestRender: vi.fn(), start: vi.fn(), stop: vi.fn() },
       goalManager: {
         isActive: vi.fn(() => false),
+        getGoal: vi.fn(() => ({ status: 'active' })),
         pause: vi.fn(),
         saveToThread: vi.fn(),
       },
@@ -230,6 +232,19 @@ describe('setupKeyboardShortcuts', () => {
     expect(state.session.abort).not.toHaveBeenCalled();
   });
 
+  it('does not register background shortcuts when background tools are disabled', () => {
+    const { state, actions } = createState(false);
+
+    setupKeyboardShortcuts(state, {
+      stop: vi.fn(),
+      doubleCtrlCMs: 500,
+      queueFollowUpMessage: vi.fn(),
+    });
+
+    expect(actions.has('openBackgroundActivityCenter')).toBe(false);
+    expect(actions.has('clearFinishedBackgroundActivities')).toBe(false);
+  });
+
   it('defaults slash-command autocomplete to the first visible built-in command before custom commands', () => {
     process.env.MASTRACODE_EXPERIMENTAL_SUBCONSCIOUS = '1';
     autocompleteProviders.length = 0;
@@ -286,7 +301,11 @@ describe('setupKeyboardShortcuts', () => {
     ]);
     expect(profileCommand?.getArgumentCompletions?.('ca').map(command => command.value)).toEqual(['capture']);
     expect(commandNames.indexOf('thread')).toBeLessThan(commandNames.indexOf('threads'));
+    expect(commandNames.indexOf('models')).toBeLessThan(commandNames.indexOf('model'));
     expect(commandNames).toContain('skill/');
+    expect(autocompleteProviders[0]?.commands.find(command => command.name === 'login')?.description).toBe(
+      'Sign in with a provider account',
+    );
     expect(commandNames).toContain('memory');
     expect(commandNames).toContain('om');
     expect(commandNames).toContain('knowledge');
@@ -592,6 +611,64 @@ describe('setupKeyboardShortcuts', () => {
     expect(state.goalManager.saveToThread).toHaveBeenCalledWith(state);
     expect(state.activeGoalJudge).toBeUndefined();
     expect(state.userInitiatedAbort).toBe(true);
+  });
+
+  it('pauses the stored goal when nothing is loaded in memory during goal judge evaluation', async () => {
+    const { state, actions } = createState(true);
+    const updateObjectiveOptions = vi.fn(async () => undefined);
+    const getObjective = vi.fn(async () => ({ status: 'active' }));
+    state.controller.getCurrentAgent.mockReturnValue({ getObjective, updateObjectiveOptions });
+    state.session.thread.getId = vi.fn(() => 'thread-1');
+    state.goalManager.getGoal.mockReturnValue(null);
+    state.activeGoalJudge = {
+      modelId: 'openai/gpt-5.5',
+      abortController: { abort: vi.fn() },
+      component: { setInterrupted: vi.fn() },
+    };
+
+    setupKeyboardShortcuts(state, {
+      stop: vi.fn(),
+      doubleCtrlCMs: 500,
+      queueFollowUpMessage: vi.fn(),
+    });
+
+    actions.get('clear')?.();
+    await vi.waitFor(() => expect(updateObjectiveOptions).toHaveBeenCalled());
+
+    expect(state.goalManager.pause).not.toHaveBeenCalled();
+    expect(state.goalManager.saveToThread).not.toHaveBeenCalled();
+    expect(updateObjectiveOptions).toHaveBeenCalledWith({
+      threadId: 'thread-1',
+      status: 'paused',
+      pausedReason: 'Judge evaluation was interrupted.',
+    });
+    expect(state.activeGoalJudge).toBeUndefined();
+  });
+
+  it('does not overwrite a stored goal that is no longer active when Esc interrupts the judge', async () => {
+    const { state, actions } = createState(true);
+    const updateObjectiveOptions = vi.fn(async () => undefined);
+    const getObjective = vi.fn(async () => ({ status: 'done' }));
+    state.controller.getCurrentAgent.mockReturnValue({ getObjective, updateObjectiveOptions });
+    state.session.thread.getId = vi.fn(() => 'thread-1');
+    state.goalManager.getGoal.mockReturnValue(null);
+    state.activeGoalJudge = {
+      modelId: 'openai/gpt-5.5',
+      abortController: { abort: vi.fn() },
+      component: { setInterrupted: vi.fn() },
+    };
+
+    setupKeyboardShortcuts(state, {
+      stop: vi.fn(),
+      doubleCtrlCMs: 500,
+      queueFollowUpMessage: vi.fn(),
+    });
+
+    actions.get('clear')?.();
+    await vi.waitFor(() => expect(getObjective).toHaveBeenCalledWith({ threadId: 'thread-1' }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(updateObjectiveOptions).not.toHaveBeenCalled();
   });
 
   it('aborts and clears an active plan approval parked in a tool suspension', () => {

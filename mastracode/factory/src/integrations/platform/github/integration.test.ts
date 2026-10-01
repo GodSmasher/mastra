@@ -1,16 +1,17 @@
 import { RequestContext } from '@mastra/core/request-context';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createBoardRegistry } from '../../../boards/index.js';
 
-import { defaultFactoryRules } from '../../../rules/defaults.js';
 import type { SourceControlStorageHandle } from '../../../storage/domains/source-control/base.js';
 import type { IntegrationContext } from '../../base.js';
 
+import { registerGithubRefreshTarget } from '../../github/token-refresh.js';
 import { createPlatformStorageForTests, mountApiRoutes } from '../test-utils.js';
 import { PlatformGithubIntegration } from './integration.js';
 
 const config = {
-  baseUrl: 'https://platform.example.com/v1',
+  baseUrl: 'https://platform.example.com',
   accessToken: 'platform-token',
 };
 
@@ -61,7 +62,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 beforeEach(() => {
-  vi.stubEnv('MASTRA_SHARED_API_URL', config.baseUrl);
+  vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', config.baseUrl);
   vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', config.accessToken);
 });
 
@@ -76,6 +77,92 @@ function createIntegration(fetchImpl?: typeof fetch): PlatformGithubIntegration 
 }
 
 describe('PlatformGithubIntegration', () => {
+  it('updates the oldest Platform-owned triage marker across comment pages and learns the actual writer', async () => {
+    const older = {
+      id: 10,
+      body: '<!-- mastra-factory-triage --> oldest',
+      htmlUrl: 'https://github.com/acme/app/issues/7#issuecomment-10',
+      user: { login: 'mastra-platform[bot]', avatarUrl: null, htmlUrl: 'https://github.com/apps/mastra-platform' },
+      createdAt: '2026-07-01T00:00:00Z',
+      updatedAt: '2026-07-01T00:00:00Z',
+    };
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        json({
+          comments: [
+            { ...older, id: 20, user: { ...older.user, login: 'person' } },
+            { ...older, id: 30 },
+            ...Array.from({ length: 28 }, (_, index) => ({
+              ...older,
+              id: 100 + index,
+              body: 'unmarked',
+              user: { ...older.user, login: 'person' },
+            })),
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(json({ comments: [older] }))
+      .mockResolvedValueOnce(json({ ...older, user: { ...older.user, login: 'actual-factory-writer[bot]' } }));
+    const integration = createIntegration(fetchImpl);
+
+    await expect(
+      integration.upsertFactoryTriageComment({
+        installationId: 7,
+        repository: 'acme/app',
+        issueNumber: 7,
+        body: '<!-- mastra-factory-triage -->\nFinal',
+      }),
+    ).resolves.toEqual({ action: 'updated', commentId: '10', url: older.htmlUrl });
+
+    expect(
+      fetchImpl.mock.calls.map(
+        ([url, init]) => `${init?.method ?? 'GET'} ${new URL(String(url)).pathname}${new URL(String(url)).search}`,
+      ),
+    ).toEqual([
+      'GET /v1/server/github/repos/acme/app/issues/7/comments?page=1&per_page=30',
+      'GET /v1/server/github/repos/acme/app/issues/7/comments?page=2&per_page=30',
+      'PATCH /v1/server/github/repos/acme/app/issues/comments/10',
+    ]);
+    expect(JSON.parse(String(fetchImpl.mock.calls[2]![1]?.body))).toEqual({
+      body: '<!-- mastra-factory-triage -->\nFinal',
+    });
+    expect(integration.isFactoryCommentAuthor('actual-factory-writer[bot]')).toBe(true);
+  });
+
+  it('creates a triage marker through the Platform proxy when no Factory marker exists', async () => {
+    const created = {
+      id: 42,
+      body: '<!-- mastra-factory-triage --> Pending',
+      htmlUrl: 'https://github.com/acme/app/issues/7#issuecomment-42',
+      user: { login: 'mastra-platform[bot]', avatarUrl: null, htmlUrl: 'https://github.com/apps/mastra-platform' },
+      createdAt: '2026-07-01T00:00:00Z',
+      updatedAt: '2026-07-01T00:00:00Z',
+    };
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(json({ comments: [{ ...created, id: 9, user: { ...created.user, login: 'person' } }] }))
+      .mockResolvedValueOnce(json(created));
+    const integration = createIntegration(fetchImpl);
+
+    await expect(
+      integration.upsertFactoryTriageComment({
+        installationId: 7,
+        repository: 'acme/app',
+        issueNumber: 7,
+        body: '<!-- mastra-factory-triage -->\nPending',
+      }),
+    ).resolves.toEqual({ action: 'created', commentId: '42', url: created.htmlUrl });
+    expect(
+      fetchImpl.mock.calls.map(
+        ([url, init]) => `${init?.method ?? 'GET'} ${new URL(String(url)).pathname}${new URL(String(url)).search}`,
+      ),
+    ).toEqual([
+      'GET /v1/server/github/repos/acme/app/issues/7/comments?page=1&per_page=30',
+      'POST /v1/server/github/repos/acme/app/issues/7/comments',
+    ]);
+  });
+
   it('lists platform-owned installations and repositories as Intake sources', async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
@@ -394,6 +481,7 @@ describe('PlatformGithubIntegration', () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(json(pullRequest))
+      .mockResolvedValueOnce(json({ connected: false, githubUsername: null }))
       .mockResolvedValueOnce(
         json({
           id: 91,
@@ -423,9 +511,84 @@ describe('PlatformGithubIntegration', () => {
       actingUserId: 'user-42',
     });
 
-    for (const call of fetchImpl.mock.calls) {
-      expect((call[1] as RequestInit).headers).toMatchObject({ 'x-acting-user-id': 'user-42' });
-    }
+    expect((fetchImpl.mock.calls[0]?.[1] as RequestInit).headers).toMatchObject({ 'x-acting-user-id': 'user-42' });
+    expect((fetchImpl.mock.calls[2]?.[1] as RequestInit).headers).toMatchObject({ 'x-acting-user-id': 'user-42' });
+  });
+
+  it('assigns a PR to the verified GitHub account of its opener', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/pulls')) return json(pullRequest);
+      if (url.includes('/user-connection?')) return json({ connected: true, githubUsername: 'grace' });
+      if (url.endsWith('/token')) return json({ token: 'installation-token' });
+      if (url.endsWith('/issues/34/assignees')) return json({ assignees: [{ login: 'grace' }] });
+      throw new Error(`Unexpected request: ${url} ${init?.method}`);
+    });
+    const integration = createIntegration(fetchImpl);
+    const created = await integration.versionControl.createPullRequest({
+      connection: { type: 'app-installation', installationId: 7 },
+      sourceId: 'acme/app',
+      title: 'Ship intake',
+      baseBranch: 'main',
+      headBranch: 'feat/intake',
+      actingUserId: 'user-42',
+    });
+
+    expect(created.assignees).toEqual(['grace']);
+    expect(fetchImpl.mock.calls.map(call => String(call[0]))).toEqual([
+      'https://platform.example.com/v1/server/github/repos/acme/app/pulls',
+      'https://platform.example.com/v1/server/github-app/user-connection?userId=user-42',
+      'https://platform.example.com/v1/server/github-app/installations/7/token',
+      'https://api.github.com/repos/acme/app/issues/34/assignees',
+    ]);
+    expect(JSON.parse(String((fetchImpl.mock.calls[2]?.[1] as RequestInit).body))).toEqual({
+      repositories: ['app'],
+      permissions: { contents: 'write', issues: 'write', pull_requests: 'write' },
+    });
+    expect(JSON.parse(String((fetchImpl.mock.calls[3]?.[1] as RequestInit).body))).toEqual({ assignees: ['grace'] });
+  });
+
+  it('does not claim an assignment when GitHub silently ignores the requested user', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async input => {
+      const url = String(input);
+      if (url.endsWith('/pulls')) return json(pullRequest);
+      if (url.includes('/user-connection?')) return json({ connected: true, githubUsername: 'grace' });
+      if (url.endsWith('/token')) return json({ token: 'installation-token' });
+      if (url.endsWith('/issues/34/assignees')) return json({ assignees: [] });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const integration = createIntegration(fetchImpl);
+    const created = await integration.versionControl.createPullRequest({
+      connection: { type: 'app-installation', installationId: 7 },
+      sourceId: 'acme/app',
+      title: 'Ship intake',
+      baseBranch: 'main',
+      headBranch: 'feat/intake',
+      actingUserId: 'user-42',
+    });
+    expect(created.assignees).toEqual([]);
+  });
+
+  it('keeps a created PR when assignment fails', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async input => {
+      const url = String(input);
+      if (url.endsWith('/pulls')) return json(pullRequest);
+      if (url.includes('/user-connection?')) return json({ connected: true, githubUsername: 'grace' });
+      if (url.endsWith('/token')) return json({ token: 'installation-token' });
+      if (url.endsWith('/issues/34/assignees')) return json({ message: 'Forbidden' }, 403);
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const integration = createIntegration(fetchImpl);
+    await expect(
+      integration.versionControl.createPullRequest({
+        connection: { type: 'app-installation', installationId: 7 },
+        sourceId: 'acme/app',
+        title: 'Ship intake',
+        baseBranch: 'main',
+        headBranch: 'feat/intake',
+        actingUserId: 'user-42',
+      }),
+    ).resolves.toMatchObject({ id: '34', url: pullRequest.htmlUrl });
   });
 
   it('maps every version-control operation to its platform endpoint', async () => {
@@ -703,7 +866,7 @@ describe('PlatformGithubIntegration', () => {
     const integration = createIntegration();
     const context = {
       auth: fakeAuth(),
-      fleet: { enabled: true },
+      sandbox: { enabled: true, provider: 'stub' },
       storage: {
         generic: seed.integrations.forIntegration('github'),
         sourceControl: seed.sourceControl.forIntegration('github'),
@@ -740,8 +903,10 @@ describe('PlatformGithubIntegration', () => {
       session: { id: 'session-1', ownerId: 'user-1', modeId: 'build' },
       getState: () => ({ factoryProjectId: 'resource-1', projectRepositoryId: 'project-repository-1' }),
     });
+    registerGithubRefreshTarget(requestContext, { orgId: 'org-1', repositoryId: 'repository-1' });
     expect(Object.keys(integration.sessionTools({ requestContext }))).toEqual([
       'github_refresh_token',
+      'github_upsert_factory_triage_comment',
       'github_subscribe_pr',
       'github_unsubscribe_pr',
     ]);
@@ -800,6 +965,22 @@ describe('PlatformGithubIntegration', () => {
     );
   });
 
+  it('isolates frozen constructor rules and rejects unknown events', () => {
+    const handler = vi.fn();
+    const rules = { issueOpened: handler, issueClosed: null };
+    const first = new PlatformGithubIntegration({ rules });
+    rules.issueOpened = vi.fn();
+    const second = new PlatformGithubIntegration();
+    expect(first.rules.issueOpened).toBe(handler);
+    expect(first.rules.issueClosed).toBeNull();
+    expect(second.rules.issueOpened).not.toBe(handler);
+    expect(second.rules.issueClosed).toBeTypeOf('function');
+    expect(Object.isFrozen(first.rules)).toBe(true);
+    expect(first.rules).not.toBe(second.rules);
+    // @ts-expect-error Verify JavaScript configuration validation.
+    expect(() => new PlatformGithubIntegration({ rules: { unknown: null } })).toThrow();
+  });
+
   it('attaches GitHub rules to polled issue ingress', async () => {
     const seed = await createPlatformStorageForTests();
     const fetchImpl = vi.fn<typeof fetch>(async input => {
@@ -807,7 +988,9 @@ describe('PlatformGithubIntegration', () => {
       if (url.includes('/issues?')) return json({ issues: [issue] });
       throw new Error(`Unexpected request: ${url}`);
     });
-    const integration = createIntegration(fetchImpl);
+    vi.stubGlobal('fetch', fetchImpl);
+    const onEvent = vi.fn();
+    const integration = new PlatformGithubIntegration({ rules: { issueOpened: onEvent } });
     const sourceControl = seed.sourceControl.forIntegration('github');
     const project = await seed.projects.create({
       orgId: 'org-1',
@@ -837,10 +1020,10 @@ describe('PlatformGithubIntegration', () => {
       sandboxProvider: 'local',
       sandboxWorkdir: '/tmp/app',
     });
-    const onEvent = vi.fn();
     const context = {
       auth: fakeAuth(),
-      fleet: { enabled: false },
+      // Only presence is read here; the callback is never invoked.
+      sandbox: (() => ({})) as never,
       storage: {
         generic: seed.integrations.forIntegration('github'),
         sourceControl,
@@ -849,12 +1032,10 @@ describe('PlatformGithubIntegration', () => {
       },
       controller: {},
       stateSigner: {},
-      rules: {
-        config: defaultFactoryRules({
-          version: 'test-rules',
-          overrides: { github: { issueOpened: { onEvent } } },
-        }),
+      runtime: {
+        configVersion: 'test-rules',
         workItems: seed.workItems,
+        boards: createBoardRegistry(),
       },
     } as unknown as IntegrationContext;
     integration.initialize?.({ storage: context.storage.generic });
@@ -910,7 +1091,7 @@ describe('PlatformGithubIntegration', () => {
     const integration = createIntegration(fetchImpl);
     const context = {
       auth: fakeAuth(),
-      fleet: { enabled: true },
+      sandbox: { enabled: true, provider: 'stub' },
       storage: {
         generic: seed.integrations.forIntegration('github'),
         sourceControl: seed.sourceControl.forIntegration('github'),
@@ -988,7 +1169,7 @@ describe('PlatformGithubIntegration', () => {
     const integration = createIntegration(fetchImpl);
     const context = {
       auth: fakeAuth(),
-      fleet: { enabled: true },
+      sandbox: { enabled: true, provider: 'stub' },
       storage: {
         generic: seed.integrations.forIntegration('github'),
         sourceControl: seed.sourceControl.forIntegration('github'),
@@ -1036,7 +1217,7 @@ describe('PlatformGithubIntegration', () => {
     const integration = createIntegration(fetchImpl);
     const context = {
       auth: fakeAuth(),
-      fleet: { enabled: true },
+      sandbox: { enabled: true, provider: 'stub' },
       storage: {
         generic: seed.integrations.forIntegration('github'),
         sourceControl: seed.sourceControl.forIntegration('github'),
@@ -1066,9 +1247,9 @@ describe('PlatformGithubIntegration', () => {
     });
   });
 
-  it('defaults the Platform base URL and requires a platform credential', () => {
-    vi.stubEnv('MASTRA_SHARED_API_URL', '');
-    expect(new PlatformGithubIntegration().diagnostics()).toMatchObject({ endpointHost: 'platform.mastra.ai' });
+  it('defaults the integrations API URL and requires a platform credential', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', '');
+    expect(new PlatformGithubIntegration().diagnostics()).toMatchObject({ endpointHost: 'integrations.mastra.ai' });
 
     vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', '');
     vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', 'injected-token');
@@ -1110,6 +1291,77 @@ describe('PlatformGithubIntegration', () => {
         issues: { enabled: false },
       },
     });
+  });
+
+  it('reuses a resolved collaborator permission instead of re-requesting it per card and event', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(json({ permission: 'write', roleName: 'write', user: actor }))
+      .mockResolvedValueOnce(json({ error: 'rate limited' }, 403))
+      .mockResolvedValueOnce(json({ permission: 'read', roleName: 'read', user: actor }));
+    const integration = createIntegration(fetchImpl);
+
+    await expect(integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'Grace')).resolves.toBe('write');
+    await expect(integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace')).resolves.toBe('write');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    // A failed lookup is not cached: the next call for that login retries.
+    await expect(integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'hank')).resolves.toBeUndefined();
+    await expect(integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'hank')).resolves.toBe('read');
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it('shares one in-flight request between overlapping lookups for the same login', async () => {
+    let release!: (value: Response) => void;
+    const fetchImpl = vi.fn<typeof fetch>(() => new Promise<Response>(resolve => (release = resolve)));
+    const integration = createIntegration(fetchImpl);
+
+    const first = integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace');
+    const second = integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'GRACE');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    release(json({ permission: 'write', roleName: 'write', user: actor }));
+    await expect(Promise.all([first, second])).resolves.toEqual(['write', 'write']);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a coalesced lookup alive for other callers when one caller's signal aborts", async () => {
+    let release!: (value: Response) => void;
+    const fetchImpl = vi.fn<typeof fetch>(() => new Promise<Response>(resolve => (release = resolve)));
+    const integration = createIntegration(fetchImpl);
+    const aborter = new AbortController();
+
+    const aborted = integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace', aborter.signal);
+    const patient = integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace');
+    aborter.abort();
+    await expect(aborted).resolves.toBeUndefined();
+
+    release(json({ permission: 'write', roleName: 'write', user: actor }));
+    await expect(patient).resolves.toBe('write');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    // The shared request never carried the caller's signal.
+    expect((fetchImpl.mock.calls[0]?.[1] as RequestInit).signal?.aborted).toBe(false);
+  });
+
+  it('re-requests a collaborator permission once the cache entry expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(json({ permission: 'write', roleName: 'write', user: actor }))
+        .mockResolvedValueOnce(json({ permission: 'read', roleName: 'read', user: actor }));
+      const integration = createIntegration(fetchImpl);
+
+      await expect(integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace')).resolves.toBe('write');
+      vi.advanceTimersByTime(29 * 60_000);
+      await expect(integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace')).resolves.toBe('write');
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(2 * 60_000);
+      await expect(integration.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace')).resolves.toBe('read');
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps the reconciliation worker alive when polling is disabled', async () => {
@@ -1159,6 +1411,20 @@ describe('PlatformGithubIntegration', () => {
         issues: { enabled: true },
       },
     });
+  });
+
+  it('removes one issue label through the Platform proxy and surfaces a missing label as a 404', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(json({})).mockResolvedValueOnce(json({}, 404));
+    const integration = createIntegration(fetchImpl);
+
+    await integration.removeIssueLabel(7, 'acme/app', 12, 'status: needs approval');
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(init?.method).toBe('DELETE');
+    expect(String(url)).toContain('/issues/12/labels/status%3A%20needs%20approval');
+
+    await expect(integration.removeIssueLabel(7, 'acme/app', 12, 'gone')).rejects.toMatchObject({ status: 404 });
+    await expect(integration.removeIssueLabel(7, 'acme/app', 12, '  ')).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   describe('resolveIntakeDispatch', () => {
@@ -1360,6 +1626,4 @@ describe('PlatformGithubIntegration', () => {
       expect(fetchImpl).toHaveBeenCalledTimes(1);
     });
   });
-
-
 });

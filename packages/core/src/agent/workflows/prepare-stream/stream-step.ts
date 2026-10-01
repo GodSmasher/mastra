@@ -25,11 +25,13 @@ interface StreamStepOptions<OUTPUT = undefined> {
   returnScorerData?: boolean;
   requireToolApproval?: RequireToolApproval;
   toolCallConcurrency?: ToolCallConcurrency;
+  eagerToolExecution?: boolean;
   resumeContext?: {
     resumeData: any;
     snapshot: any;
   };
   agentId: string;
+  agentVersionId?: string;
   agentName?: string;
   toolCallId?: string;
   methodType: AgentMethodType;
@@ -58,8 +60,10 @@ export function createStreamStep<OUTPUT = undefined>({
   returnScorerData,
   requireToolApproval,
   toolCallConcurrency,
+  eagerToolExecution,
   resumeContext,
   agentId,
+  agentVersionId,
   agentName,
   toolCallId,
   methodType,
@@ -107,6 +111,7 @@ export function createStreamStep<OUTPUT = undefined>({
         ...resolveObservabilityContext(observabilityContext),
         requireToolApproval,
         toolCallConcurrency,
+        eagerToolExecution,
         resumeContext,
         _internal: {
           generateId: capabilities.generateMessageId,
@@ -124,6 +129,7 @@ export function createStreamStep<OUTPUT = undefined>({
           initialSignalEchoes: loopOptions.initialSignalEchoes,
         },
         agentId,
+        agentVersionId,
         agentName,
         toolCallId,
         methodType: modelMethodType,

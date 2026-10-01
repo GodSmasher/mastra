@@ -1,4 +1,6 @@
 import type { MastraDBMessage, MastraMessagePart } from '@mastra/core/agent-controller';
+import { formatDate } from '@mastra/playground-ui/utils/date-format';
+import type { DatePreset } from '@mastra/playground-ui/utils/date-format';
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
@@ -15,12 +17,14 @@ function assistantMessage(
   id: string,
   parts: MastraDBMessage['content']['parts'],
   runtimeTools?: Record<string, ToolCall>,
+  streaming?: boolean,
 ): TimelineEntry {
   return {
     kind: 'message',
     id,
     message: { id, role: 'assistant', createdAt: CREATED_AT, content: { format: 2, parts } },
     runtimeTools,
+    streaming,
   };
 }
 
@@ -116,6 +120,32 @@ describe('TranscriptEntries tool rows', () => {
     expect(within(row).queryByText('execute_command')).not.toBeInTheDocument();
   });
 
+  it("shows a shell command's description alone on its row and the command when expanded", async () => {
+    const command = "cd packages/core && rg -n 'processor' src";
+    renderEntries([
+      assistantMessage('msg-1', [
+        {
+          type: 'tool-invocation',
+          toolInvocation: {
+            state: 'result',
+            toolCallId: 'call-1',
+            toolName: 'execute_command',
+            args: { description: 'Finding the processor wiring', command },
+            result: 'src/a.ts:1:processor',
+          },
+        },
+      ]),
+    ]);
+
+    const row = screen.getByRole('group', { name: 'Tool: execute_command' });
+    expect(within(row).getByText('Finding the processor wiring')).toBeInTheDocument();
+    expect(within(row).queryByText('Run')).not.toBeInTheDocument();
+    expect(within(row).queryByText(/rg -n/)).not.toBeInTheDocument();
+
+    await userEvent.click(within(row).getAllByRole('button')[0]);
+    expect(within(row).getByText(/rg -n 'processor' src/)).toBeInTheDocument();
+  });
+
   it('collapses three or more consecutive tool calls into a single group row', async () => {
     renderEntries([
       assistantMessage('msg-1', [
@@ -130,6 +160,26 @@ describe('TranscriptEntries tool rows', () => {
 
     await userEvent.click(within(group).getAllByRole('button')[0]);
     expect(screen.getAllByRole('group', { name: 'Tool: view' })).toHaveLength(2);
+  });
+
+  it('folds a still-arriving run as it plays, so the reply reads as one busy row', async () => {
+    renderEntries([
+      assistantMessage(
+        'msg-1',
+        [
+          doneTool('call-1', 'view'),
+          doneTool('call-2', 'search_content'),
+          runningTool('call-3', 'execute_command', { command: 'pnpm test' }),
+        ],
+        undefined,
+        true,
+      ),
+    ]);
+
+    const group = await screen.findByRole('group', { name: 'Tool group: 3 steps' }, { timeout: 5000 });
+    expect(group).toHaveAttribute('aria-busy', 'true');
+    expect(within(group).getByText('pnpm test')).toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Tool: view' })).not.toBeInTheDocument();
   });
 
   it('surfaces the running action live on a collapsed group header', () => {
@@ -148,6 +198,59 @@ describe('TranscriptEntries tool rows', () => {
     expect(within(group).getByRole('img', { name: 'Read, Run' })).toBeInTheDocument();
     expect(within(group).getByText('3/4')).toBeInTheDocument();
     expect(group).toHaveAttribute('aria-busy', 'true');
+  });
+
+  it('folds the rows above once a third call lands under the reader', async () => {
+    const restored = [doneTool('call-1', 'view'), doneTool('call-2', 'view')];
+    const { rerender } = renderEntries([assistantMessage('msg-1', restored)]);
+    expect(screen.getAllByRole('group', { name: 'Tool: view' })).toHaveLength(2);
+
+    rerender(
+      <MemoryRouter>
+        <TranscriptEntries
+          entries={[assistantMessage('msg-1', [...restored, doneTool('call-3', 'view')])]}
+          onApprove={() => {}}
+          onRespond={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole('group', { name: 'Tool group: 3 steps' }, { timeout: 3000 });
+    expect(screen.queryByRole('group', { name: 'Tool: view' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the words on screen in place when an ask_user prompt fills its slot above them', () => {
+    const askUser = runningTool('call-ask', 'ask_user', { question: 'Which auth flow?' });
+    const parts = [
+      { type: 'text' as const, text: 'Two flows exist.\n\n' },
+      askUser,
+      { type: 'text' as const, text: 'Both are supported.' },
+    ];
+    const { rerender } = renderEntries([assistantMessage('msg-1', parts)]);
+    const settledText = screen.getByText('Both are supported.');
+
+    rerender(
+      <MemoryRouter>
+        <TranscriptEntries
+          entries={[
+            assistantMessage('msg-1', parts),
+            {
+              kind: 'suspension',
+              id: 'suspension-call-ask',
+              toolCallId: 'call-ask',
+              toolName: 'ask_user',
+              args: {},
+              suspendPayload: { question: 'Which auth flow?' },
+            },
+          ]}
+          onApprove={() => {}}
+          onRespond={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('group', { name: 'Question from the agent' })).toBeInTheDocument();
+    expect(screen.getByText('Both are supported.')).toBe(settledText);
   });
 
   it('does not group runs broken by prose', () => {
@@ -229,7 +332,7 @@ describe('TranscriptEntries tool rows', () => {
       assistantMessage('msg-1', [
         doneTool('call-1', 'view'),
         doneTool('call-2', 'view'),
-        runningTool('call-3', 'ask_user', {}),
+        runningTool('call-3', 'ask_user', { question: 'Which file should I edit?' }),
         doneTool('call-4', 'view'),
         doneTool('call-5', 'view'),
       ]),
@@ -248,18 +351,41 @@ describe('TranscriptEntries tool rows', () => {
     expect(within(question).getByText('Which file should I edit?')).toBeInTheDocument();
   });
 
-  it('ignores an ask_user still waiting for its prompt so the run around it stays one group', () => {
-    renderEntries([
-      assistantMessage('msg-1', [
-        doneTool('call-1', 'view'),
-        doneTool('call-2', 'view'),
-        runningTool('call-3', 'ask_user', {}),
-        doneTool('call-4', 'view'),
-      ]),
+  it('breaks the run at a waiting ask_user so nothing regroups when its prompt lands', () => {
+    const message = assistantMessage('msg-1', [
+      doneTool('call-1', 'view'),
+      doneTool('call-2', 'view'),
+      doneTool('call-3', 'view'),
+      runningTool('call-4', 'ask_user', {}),
+      doneTool('call-5', 'view'),
     ]);
+    const { rerender } = renderEntries([message]);
 
     expect(screen.getByRole('group', { name: 'Tool group: 3 steps' })).toBeInTheDocument();
     expect(screen.queryByRole('group', { name: 'Question from the agent' })).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <TranscriptEntries
+          entries={[
+            message,
+            {
+              kind: 'suspension',
+              id: 'susp-1',
+              toolCallId: 'call-4',
+              toolName: 'ask_user',
+              args: {},
+              suspendPayload: { question: 'Which file should I edit?' },
+            },
+          ]}
+          onApprove={() => {}}
+          onRespond={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('group', { name: 'Tool group: 3 steps' })).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: 'Question from the agent' })).toBeInTheDocument();
   });
 
   it('trusts the persisted result over a stale running overlay — a lost tool_end must not spin forever', () => {
@@ -325,12 +451,63 @@ describe('TranscriptEntries tool rows', () => {
       assistantMessage('msg-text', [{ type: 'text', text: 'All 36 tests passed.' }]),
     ]);
 
-    // The transcript container no longer adds gaps between entries, so prose
-    // content must own its breathing room via explicit margins.
-    const userBubbleWrapper = screen.getByText('Please run the tests').closest('.items-end');
+    const userBubbleWrapper = screen.getByText('Please run the tests').closest('.ml-auto');
     expect(userBubbleWrapper).toHaveClass('my-3');
 
     const assistantProse = screen.getByText('All 36 tests passed.').closest('.mastra-markdown');
     expect(assistantProse).toHaveClass('my-3');
+  });
+
+  describe('local timestamps', () => {
+    const PART_AT = new Date('2026-07-15T10:03:42.000Z');
+
+    function shown(date: Date, preset: DatePreset): string {
+      const text = formatDate(date, preset);
+      if (text === undefined) throw new Error(`${date.toISOString()} is not a valid date`);
+      return text;
+    }
+
+    it('leads a tool row with the moment core stamped on the call, in local time', () => {
+      renderEntries([
+        assistantMessage('msg-1', [
+          { ...doneTool('call-1', 'execute_command', { command: 'pnpm build' }), createdAt: PART_AT.getTime() },
+        ]),
+      ]);
+
+      const row = screen.getByRole('group', { name: 'Tool: execute_command' });
+      const time = within(row).getByText(shown(PART_AT, 'time-seconds'));
+      expect(time.tagName).toBe('TIME');
+      expect(time).toHaveAttribute('dateTime', PART_AT.toISOString());
+      expect(time).toHaveAttribute('title', shown(PART_AT, 'date-time-seconds'));
+      expect(
+        time.compareDocumentPosition(within(row).getByText('Run')) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it('falls back to the message time for calls core never stamped', () => {
+      renderEntries([assistantMessage('msg-1', [doneTool('call-1', 'view')])]);
+
+      const row = screen.getByRole('group', { name: 'Tool: view' });
+      expect(within(row).getByText(shown(CREATED_AT, 'time-seconds'))).toHaveAttribute(
+        'dateTime',
+        CREATED_AT.toISOString(),
+      );
+    });
+
+    it('leads a group row with the time its first call began', () => {
+      renderEntries([
+        assistantMessage('msg-1', [
+          { ...doneTool('call-1', 'view'), createdAt: PART_AT.getTime() },
+          { ...doneTool('call-2', 'search_content'), createdAt: PART_AT.getTime() + 1000 },
+          { ...doneTool('call-3', 'view'), createdAt: PART_AT.getTime() + 2000 },
+        ]),
+      ]);
+
+      const group = screen.getByRole('group', { name: 'Tool group: 3 steps' });
+      expect(within(group).getByText(shown(PART_AT, 'time-seconds'))).toBeInTheDocument();
+      expect(
+        within(group).queryByText(shown(new Date(PART_AT.getTime() + 2000), 'time-seconds')),
+      ).not.toBeInTheDocument();
+    });
   });
 });

@@ -9,9 +9,9 @@ const STATUS_LABELS: Record<TraceStatusValueStatus, string> = {
 };
 
 const STATUS_STYLES: Record<TraceStatusValueStatus, string> = {
-  success: 'text-accent1',
-  error: 'text-error',
-  running: 'text-neutral4',
+  success: 'text-success-indicator',
+  error: 'text-destructive-foreground',
+  running: 'text-muted-foreground',
 };
 
 export interface TraceStatusValueProps {
@@ -22,9 +22,9 @@ export function TraceStatusValue({ status }: TraceStatusValueProps) {
   const label = STATUS_LABELS[status];
   const className = STATUS_STYLES[status];
 
-  if (status === 'running') {
-    return <Shimmer className={className}>{label}</Shimmer>;
-  }
-
-  return <span className={className}>{label}</span>;
+  return (
+    <Shimmer active={status === 'running'} className={className}>
+      {label}
+    </Shimmer>
+  );
 }

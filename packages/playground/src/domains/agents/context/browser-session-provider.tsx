@@ -1,6 +1,6 @@
+import { useBrowserSessionProbe } from '@mastra/playground-ui/domains/agents/hooks/use-browser-session-probe';
 import { useCallback, useState, useMemo, useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
-import { useBrowserSessionProbe } from '../hooks/use-browser-session-probe';
 import type { StreamStatus } from '../hooks/use-browser-stream';
 import { useCloseBrowser } from '../hooks/use-close-browser';
 import { createBrowserFrameStore } from './browser-frame-store';
@@ -34,9 +34,12 @@ export interface BrowserSessionProviderProps {
  * keep the surrounding UI from re-rendering at frame rate.
  *
  * 1. **`enabled` gate (client-side, cheap pre-filter).** Callers pass
- *    `enabled={agent.browserTools?.length > 0}`. When false, the probe never
- *    fires and the WS never opens. This is the cheap "we already know this
- *    agent has no browser, don't even ask the server" check.
+ *    `enabled={Boolean(agent?.hasBrowser ?? agent?.browserTools?.length)}`.
+ *    `hasBrowser` covers both agent-level SDK browsers and workspace-level CLI
+ *    browsers (which expose no SDK tools); the tool-count fallback keeps older
+ *    servers working. When false, the probe never fires and the WS never
+ *    opens. This is the cheap "we already know this agent has no browser,
+ *    don't even ask the server" check.
  *
  * 2. **Probe (server-side, authoritative).** When enabled, the provider asks
  *    the server `{ hasSession, screencastAvailable }` once. `tool-fallback.tsx`

@@ -11,8 +11,9 @@ export function findLastCompletedObservationBoundary(message: MastraDBMessage): 
 
   // Search from the end to find the most recent end marker
   for (let i = parts.length - 1; i >= 0; i--) {
-    const part = parts[i] as { type?: string };
-    if (part?.type === 'data-om-observation-end') {
+    const part = parts[i] as { type?: string; data?: { operationType?: string } };
+    // Reflection markers live on the user message but do not observe its parts.
+    if (part?.type === 'data-om-observation-end' && part.data?.operationType !== 'reflection') {
       return i;
     }
   }
@@ -178,20 +179,20 @@ function getUnobservedPartsPreservingToolCallPairs(message: MastraDBMessage): Ma
 /**
  * Get the messages Observational Memory is allowed to work with.
  *
- * Messages supplied through the `context` option are per-run ephemeral input. Core's
- * persistence contract already treats them as never-persist: `MessageStateManager` routes
- * them into `userContextMessages`, and `drainUnsavedMessages` only drains input/response.
+ * Messages supplied through the `context` option and the synthetic `om-continuation`
+ * message are prompt-only input. Core's persistence contract already treats context as
+ * never-persist, while the continuation remains memory-sourced so it can stay in the live
+ * actor prompt.
  *
- * OM builds its windows from `get.all.db()`, which includes context messages, and then
- * seals and persists candidates directly — turning ephemeral context into durable user
- * messages. Excluding them here keeps OM's window, sealing, persistence and token
- * accounting consistent with that contract.
+ * OM builds its windows from `get.all.db()`, which includes both categories, and then seals
+ * and persists candidates directly. Excluding them here keeps OM's observation, buffering,
+ * persistence, and token accounting consistent with their ephemeral contract.
  */
 export function getObservableMessages(messageList: MessageList): MastraDBMessage[] {
-  const allMessages = messageList.get.all.db();
   const contextMessageIds = messageList.makeMessageSourceChecker().context;
-  if (contextMessageIds.size === 0) return allMessages;
-  return allMessages.filter(message => !contextMessageIds.has(message.id));
+  return messageList.get.all.db().filter(message => {
+    return message.id !== 'om-continuation' && !contextMessageIds.has(message.id);
+  });
 }
 
 /**
@@ -297,7 +298,9 @@ export function filterObservedMessages(opts: {
   }
 }
 
-export function getBufferedChunks(record: ObservationalMemoryRecord | null | undefined): BufferedObservationChunk[] {
+export function getBufferedChunks(
+  record: Pick<ObservationalMemoryRecord, 'bufferedObservationChunks'> | null | undefined,
+): BufferedObservationChunk[] {
   if (!record?.bufferedObservationChunks) return [];
   if (Array.isArray(record.bufferedObservationChunks)) return record.bufferedObservationChunks;
   if (typeof record.bufferedObservationChunks === 'string') {

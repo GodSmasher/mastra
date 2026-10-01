@@ -41,11 +41,13 @@ interface CreatePrepareStreamWorkflowOptions<OUTPUT = undefined> {
   saveQueueManager?: SaveQueueManager;
   requireToolApproval?: RequireToolApproval;
   toolCallConcurrency?: ToolCallConcurrency;
+  eagerToolExecution?: boolean;
   resumeContext?: {
     resumeData: any;
     snapshot: any;
   };
   agentId: string;
+  agentVersionId?: string;
   agentName?: string;
   toolCallId?: string;
   workspace?: Workspace;
@@ -78,8 +80,10 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
   saveQueueManager,
   requireToolApproval,
   toolCallConcurrency,
+  eagerToolExecution,
   resumeContext,
   agentId,
+  agentVersionId,
   agentName,
   toolCallId,
   workspace,
@@ -139,8 +143,10 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
     returnScorerData,
     requireToolApproval,
     toolCallConcurrency,
+    eagerToolExecution,
     resumeContext,
     agentId,
+    agentVersionId,
     agentName,
     toolCallId,
     methodType,
@@ -169,6 +175,7 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
     memoryConfig,
     agentSpan,
     agentId,
+    agentVersionId,
     methodType,
     saveQueueManager,
     runScope,

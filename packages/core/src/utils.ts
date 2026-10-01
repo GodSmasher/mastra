@@ -4,7 +4,7 @@ import { jsonSchemaToZod } from '@mastra/schema-compat/json-to-zod';
 import { z } from 'zod/v4';
 import type { MastraPrimitives } from './action';
 import type { ToolsInput } from './agent';
-import type { ToolBackgroundConfig } from './background-tasks';
+import type { AgentBackgroundConfig, ToolBackgroundConfig } from './background-tasks';
 import type { MastraBrowser } from './browser/browser';
 import { ErrorCategory, ErrorDomain, MastraError } from './error';
 import type { MastraLanguageModel, MastraLegacyLanguageModel } from './llm/model/shared.types';
@@ -29,7 +29,20 @@ export type { FetchWithRetryOptions } from './utils/fetchWithRetry';
 export { boundedStringify, ensureSerializable, isBoundedSerializable, safeStringify } from './utils/safe-stringify';
 export { deepEqual } from './utils/deep-equal';
 
-export const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+export const delay = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>(resolve => {
+    if (signal?.aborted) return resolve();
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 
 /**
  * Read a positive-integer environment variable (e.g. a TTL in ms). Unset, empty,
@@ -297,6 +310,12 @@ export interface ToolOptions extends Partial<ObservabilityContext> {
    */
   workspace?: Workspace;
   backgroundConfig?: ToolBackgroundConfig;
+  /**
+   * Agent-level backgroundTasks config. Combined with `backgroundConfig` (the
+   * tool-level config) to decide whether the `_background` override schema is
+   * injected for this specific tool. See `isToolBackgroundEligible`.
+   */
+  agentBackgroundConfig?: AgentBackgroundConfig;
   /**
    * Browser available for tool execution. When provided, tools can access
    * browser capabilities for web automation, screenshots, and data extraction.

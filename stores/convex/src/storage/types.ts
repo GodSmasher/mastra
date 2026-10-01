@@ -83,6 +83,7 @@ export type StorageRequest =
       tableName: TABLE_NAMES | string;
       id: string;
       record: Record<string, any>;
+      expected?: Record<string, any>;
     }
   | {
       op: 'updateThread';
@@ -206,6 +207,11 @@ export type StorageRequest =
       /** ISO timestamp; records with createdAt <= to */
       to?: string;
       offset?: number;
+      groupId?: string;
+      recordId?: string;
+      beforeGeneration?: number;
+      afterGeneration?: number;
+      sortDirection?: 'ASC' | 'DESC';
     }
   | {
       op: 'omUpdateActive';

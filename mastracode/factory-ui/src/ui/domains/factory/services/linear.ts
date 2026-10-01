@@ -7,6 +7,8 @@
  * talks to Linear's GraphQL API on the org's behalf.
  */
 
+import { RequestError } from './request';
+
 export type LinearStatusReason =
   | 'missing_config'
   | 'auth_required'
@@ -35,9 +37,20 @@ export interface LinearIssue {
   assignee: string | null;
   creator?: string | null;
   team: string | null;
+  /** Selected intake source (project or team); matches an intake binding's `sourceId`. */
+  sourceId?: string | null;
+  /** Actual Linear project, even when the issue was routed through a team. */
+  projectId?: string | null;
   labels: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface LinearIssueDetail {
+  identifier: string;
+  title: string;
+  url: string;
+  description: string | null;
 }
 
 export interface LinearIssuePage {
@@ -105,8 +118,8 @@ async function getLinearResource<T>(baseUrl: string, path: string): Promise<T> {
     } catch {
       /* ignore non-JSON */
     }
-    const err = new Error(message);
-    (err as { code?: string }).code = code;
+    const err = new RequestError(message, res.status);
+    (err as RequestError & { code?: string }).code = code;
     throw err;
   }
   return (await res.json()) as T;
@@ -131,8 +144,54 @@ export async function listLinearIssues(
   return getLinearResource<LinearIssuePage>(baseUrl, `/web/linear/issues?${params.toString()}`);
 }
 
+export async function getLinearIssue(
+  baseUrl: string,
+  factoryProjectId: string,
+  identifier: string,
+  issueId?: string,
+): Promise<LinearIssueDetail> {
+  const params = new URLSearchParams({ factoryProjectId });
+  if (issueId) params.set('issueId', issueId);
+  return getLinearResource<LinearIssueDetail>(
+    baseUrl,
+    `/web/linear/issues/${encodeURIComponent(identifier)}?${params.toString()}`,
+  );
+}
+
 /** List the connected workspace's projects (Settings intake-source picker). */
 export async function listLinearProjects(baseUrl: string): Promise<LinearProject[]> {
   const { projects } = await getLinearResource<{ projects: LinearProject[] }>(baseUrl, '/web/linear/projects');
   return projects;
+}
+
+/** A Linear team, selectable as an intake source in its own right. */
+export interface LinearTeam {
+  id: string;
+  /** Short team key, e.g. `ENG`. */
+  key: string;
+  name: string;
+  /** Opaque backend-generated intake source id. */
+  sourceId?: string;
+  /** Present when a backend spans more than one Linear workspace. */
+  workspaceId?: string;
+}
+
+/** List the connected workspace's teams (Settings intake-source picker). */
+export async function listLinearTeams(baseUrl: string): Promise<LinearTeam[]> {
+  const { teams } = await getLinearResource<{ teams: LinearTeam[] }>(baseUrl, '/web/linear/teams');
+  return teams;
+}
+
+/**
+ * Resolve the opaque intake source id for a whole Linear team. New backends
+ * provide it explicitly; the raw-id form preserves older self-managed DTOs.
+ */
+export const LINEAR_TEAM_SOURCE_PREFIX = 'linear-team:';
+
+export function linearTeamSourceId(team: Pick<LinearTeam, 'id' | 'sourceId'>): string {
+  return team.sourceId ?? `${LINEAR_TEAM_SOURCE_PREFIX}${team.id}`;
+}
+
+export function isLinearTeamSourceId(sourceId: string): boolean {
+  return sourceId.startsWith(LINEAR_TEAM_SOURCE_PREFIX);
 }

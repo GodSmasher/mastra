@@ -74,6 +74,11 @@ createWorkflowTestSuite({
   },
 
   beforeEach: async () => {
+    // These workflows share a single storage instance and rely on real, unique run
+    // IDs so a previous test's snapshot can never be mistaken for the current run.
+    // The shared test setup installs a deterministic `globalThis.crypto.randomUUID`
+    // spy before every test, so undo it for this suite.
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockRestore();
     vi.clearAllMocks();
   },
 
@@ -274,6 +279,216 @@ describe('Workflow (Default Engine Specifics)', () => {
         startedAt: expect.any(Number),
         endedAt: expect.any(Number),
       });
+    });
+
+    it('does not resolve before workflow dispatch is durable', async () => {
+      let releaseOnStart!: () => void;
+      const onStartGate = new Promise<void>(resolve => {
+        releaseOnStart = resolve;
+      });
+      const onStart = vi.fn(() => onStartGate);
+
+      const step = createStep({
+        id: 'step',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: vi.fn().mockResolvedValue({}),
+      });
+      const workflow = createWorkflow({
+        id: 'durable-startAsync-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        options: { onStart },
+      })
+        .then(step)
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'durable-startAsync-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot');
+      let startReturned = false;
+      const startPromise = run.startAsync({ inputData: {} }).then(result => {
+        startReturned = true;
+        return result;
+      });
+
+      await vi.waitFor(() => expect(onStart).toHaveBeenCalledOnce());
+      const snapshotWhileOnStartWasBlocked = await workflowsStore?.getWorkflowRunById({
+        workflowName: workflow.id,
+        runId: run.runId,
+      });
+      const returnedWhileSnapshotWasPending = startReturned;
+
+      releaseOnStart();
+      await startPromise;
+      const snapshotAfterStartReturned = await workflowsStore?.getWorkflowRunById({
+        workflowName: workflow.id,
+        runId: run.runId,
+      });
+
+      const dispatchSnapshot = persistSnapshot.mock.calls.find(
+        ([args]) => (args.snapshot as any).status === 'waiting',
+      )?.[0].snapshot as any;
+
+      expect((snapshotWhileOnStartWasBlocked?.snapshot as any)?.status).toBe('pending');
+      expect(returnedWhileSnapshotWasPending).toBe(false);
+      expect(dispatchSnapshot).toMatchObject({
+        status: 'waiting',
+        context: { input: {} },
+        activePaths: [0],
+        activeStepsPath: {},
+        suspendedPaths: {},
+        waitingPaths: {},
+      });
+      expect(dispatchSnapshot.serializedStepGraph).toBeDefined();
+      expect((snapshotAfterStartReturned?.snapshot as any)?.status).not.toBe('pending');
+    });
+
+    it('preserves null input in the durable dispatch snapshot', async () => {
+      const workflow = createWorkflow({
+        id: 'null-input-startAsync-workflow',
+        inputSchema: z.null(),
+        outputSchema: z.object({}),
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.null(),
+            outputSchema: z.object({}),
+            execute: vi.fn().mockResolvedValue({}),
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'null-input-startAsync-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot');
+
+      await run.startAsync({ inputData: null });
+
+      const dispatchSnapshot = persistSnapshot.mock.calls.find(
+        ([args]) => (args.snapshot as any).status === 'waiting',
+      )?.[0].snapshot as any;
+      expect(dispatchSnapshot.context).toEqual({ input: null });
+    });
+
+    it('rejects without executing when onStart fails', async () => {
+      const execute = vi.fn().mockResolvedValue({});
+      const workflow = createWorkflow({
+        id: 'rejected-startAsync-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        options: {
+          onStart: () => {
+            throw new Error('start rejected');
+          },
+        },
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute,
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'rejected-startAsync-workflow': workflow } });
+
+      const run = await workflow.createRun();
+
+      await expect(run.startAsync({ inputData: {} })).rejects.toThrow('start rejected');
+      expect(execute).not.toHaveBeenCalled();
+      expect((await workflow.getWorkflowRunById(run.runId))?.status).toBe('pending');
+    });
+
+    it('rejects when the durable dispatch snapshot cannot be persisted', async () => {
+      const execute = vi.fn().mockResolvedValue({});
+      const workflow = createWorkflow({
+        id: 'failed-dispatch-persistence-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute,
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'failed-dispatch-persistence-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot').mockRejectedValueOnce(new Error('storage unavailable'));
+
+      await expect(run.startAsync({ inputData: {} })).rejects.toThrow('storage unavailable');
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('respects snapshot persistence opt-out for startAsync', async () => {
+      const execute = vi.fn().mockResolvedValue({});
+      const workflow = createWorkflow({
+        id: 'non-persisting-startAsync-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        options: { shouldPersistSnapshot: () => false },
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute,
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'non-persisting-startAsync-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot');
+
+      await expect(run.startAsync({ inputData: {} })).resolves.toEqual({ runId: run.runId });
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+
+      expect(persistSnapshot.mock.calls.some(([args]) => (args.snapshot as any).status === 'waiting')).toBe(false);
+    });
+
+    it('does not add the startAsync dispatch snapshot to synchronous start', async () => {
+      const workflow = createWorkflow({
+        id: 'synchronous-start-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute: vi.fn().mockResolvedValue({}),
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'synchronous-start-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot');
+
+      await run.start({ inputData: {} });
+
+      expect(persistSnapshot.mock.calls.some(([args]) => (args.snapshot as any).status === 'waiting')).toBe(false);
     });
   });
 
@@ -623,6 +838,53 @@ describe('Workflow (Default Engine Specifics)', () => {
       expect(stepResult?.nonRetryable).toBe(true);
     });
 
+    it('does not retry nested workflows with non-retryable step failures', async () => {
+      let calls = 0;
+
+      const fatalStep = createStep({
+        id: 'nested-fatal-step',
+        execute: async () => {
+          calls++;
+          throw new MastraNonRetryableError('permanent failure');
+        },
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      const nestedWorkflow = createWorkflow({
+        id: 'nested-fatal-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        steps: [fatalStep],
+      });
+      nestedWorkflow.then(fatalStep).commit();
+
+      const workflow = createWorkflow({
+        id: 'non-retryable-parent-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        retryConfig: { attempts: 3, delay: 0 },
+        steps: [nestedWorkflow],
+      });
+      workflow.then(nestedWorkflow).commit();
+
+      new Mastra({
+        logger: false,
+        storage: testStorage,
+        workflows: { 'non-retryable-parent-workflow': workflow },
+      });
+
+      const run = await workflow.createRun();
+      const result = await run.start({ inputData: {} });
+
+      expect(result.status).toBe('failed');
+      expect(calls).toBe(1);
+
+      const stepResult = result.steps['nested-fatal-workflow'];
+      expect(stepResult?.status).toBe('failed');
+      expect(stepResult?.nonRetryable).toBe(true);
+    });
+
     it('retries workflow steps that throw transient errors until attempts are exhausted', async () => {
       let calls = 0;
 
@@ -658,6 +920,53 @@ describe('Workflow (Default Engine Specifics)', () => {
       expect(calls).toBe(4);
 
       const stepResult = result.steps['transient-step'];
+      expect(stepResult?.status).toBe('failed');
+      expect(stepResult?.nonRetryable).toBeUndefined();
+    });
+
+    it('retries nested workflows with transient step failures', async () => {
+      let calls = 0;
+
+      const transientStep = createStep({
+        id: 'nested-transient-step',
+        execute: async () => {
+          calls++;
+          throw new Error('transient failure');
+        },
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      const nestedWorkflow = createWorkflow({
+        id: 'nested-transient-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        steps: [transientStep],
+      });
+      nestedWorkflow.then(transientStep).commit();
+
+      const workflow = createWorkflow({
+        id: 'retryable-parent-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        retryConfig: { attempts: 3, delay: 0 },
+        steps: [nestedWorkflow],
+      });
+      workflow.then(nestedWorkflow).commit();
+
+      new Mastra({
+        logger: false,
+        storage: testStorage,
+        workflows: { 'retryable-parent-workflow': workflow },
+      });
+
+      const run = await workflow.createRun();
+      const result = await run.start({ inputData: {} });
+
+      expect(result.status).toBe('failed');
+      expect(calls).toBe(4);
+
+      const stepResult = result.steps['nested-transient-workflow'];
       expect(stepResult?.status).toBe('failed');
       expect(stepResult?.nonRetryable).toBeUndefined();
     });

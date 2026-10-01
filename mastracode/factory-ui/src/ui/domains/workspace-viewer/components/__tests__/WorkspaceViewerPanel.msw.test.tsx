@@ -15,6 +15,8 @@ const DIFF_URL = `${TEST_BASE_URL}/web/workspace/changes/diff`;
 const WORKSPACE = 'session-1';
 const THREAD = 'thread-1';
 
+Object.defineProperty(CSSStyleSheet.prototype, 'replaceSync', { value: () => {} });
+
 function installHandlers() {
   const fileRequests: Array<{ path: string | null; threadId: string | null }> = [];
   server.use(
@@ -124,8 +126,9 @@ describe('WorkspaceViewerPanel', () => {
       await user.click(await screen.findByText('agent.ts'));
 
       const changesPanel = await screen.findByTestId('workspace-changes-panel');
-      expect(await within(changesPanel).findByLabelText('Workspace change diff')).toHaveTextContent(
-        'export const agent = {};',
+      const diff = await within(changesPanel).findByLabelText('Workspace change diff');
+      await waitFor(() =>
+        expect(diff.querySelector('diffs-container')?.shadowRoot?.textContent).toContain('export const agent = {};'),
       );
       expect(within(changesPanel).queryByText('new file mode 100644')).not.toBeInTheDocument();
       await user.click(screen.getByRole('button', { name: 'Back to changed files' }));
@@ -144,7 +147,8 @@ describe('WorkspaceViewerPanel', () => {
           return HttpResponse.json({
             workspacePath: WORKSPACE,
             path,
-            patch: '@@ -1 +1 @@\n-export {}\n+export const agent = {};\n',
+            patch:
+              'diff --git a/src/agent.ts b/src/agent.ts\nindex 1234567..abcdef0 100644\n--- a/src/agent.ts\n+++ b/src/agent.ts\n@@ -1 +1 @@\n-export {}\n+export const agent = {};\n',
             truncated: false,
           });
         }),
@@ -200,6 +204,28 @@ describe('WorkspaceViewerPanel', () => {
       renderWithProviders(<WorkspaceViewerPanel workspacePath={WORKSPACE} threadId={THREAD} />);
 
       expect(await screen.findByRole('button', { name: /Files No files/ })).toBeInTheDocument();
+    });
+  });
+
+  describe('when the session sandbox is not running', () => {
+    it('reports the sandbox state instead of pretending changes are pending', async () => {
+      installHandlers();
+      // Changes are the live-VM-backed surface: the server reports
+      // `available: false` when no session sandbox is running (nothing is
+      // ever provisioned by browsing).
+      server.use(
+        http.get(CHANGES_URL, () => HttpResponse.json({ workspacePath: WORKSPACE, available: false, changes: [] })),
+      );
+      const user = userEvent.setup();
+
+      renderWithProviders(<WorkspaceViewerPanel workspacePath={WORKSPACE} threadId={THREAD} />);
+
+      const changesButton = await screen.findByRole('button', { name: /Changes No sandbox/ });
+      await user.click(changesButton);
+
+      expect(
+        await screen.findByText('No sandbox running. Changes appear once the session sandbox starts.'),
+      ).toBeInTheDocument();
     });
   });
 });

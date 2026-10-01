@@ -1,8 +1,10 @@
-import { Badge } from '@mastra/playground-ui/components/Badge';
 import { Button } from '@mastra/playground-ui/components/Button';
+import { CopyButton } from '@mastra/playground-ui/components/CopyButton';
 import {
   Dialog,
+  DialogAction,
   DialogBody,
+  DialogCancel,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -11,7 +13,7 @@ import {
 } from '@mastra/playground-ui/components/Dialog';
 import { Input } from '@mastra/playground-ui/components/Input';
 import { Txt } from '@mastra/playground-ui/components/Txt';
-import { Copy, ExternalLink, Loader2 } from 'lucide-react';
+import { ExternalLink, Loader2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
 import type { OAuthStartResponse } from '../../../../api/types';
@@ -48,9 +50,7 @@ function PasteCodeDialog({ provider, session, onClose, onComplete }: ProviderOAu
     try {
       await completeMutation.mutateAsync({ provider, sessionId: session.sessionId, code: authorizationCode });
       onComplete();
-    } catch {
-      // Mutation error is rendered below.
-    }
+    } catch {}
   };
 
   const close = () => {
@@ -58,17 +58,17 @@ function PasteCodeDialog({ provider, session, onClose, onComplete }: ProviderOAu
   };
 
   return (
-    <Dialog open onOpenChange={open => !open && close()}>
+    <Dialog open onOpenChange={open => !open && close()} pending={completeMutation.isPending}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Sign in to {displayName}</DialogTitle>
           <DialogDescription>Authorize your account and paste the returned code.</DialogDescription>
         </DialogHeader>
-        <DialogBody className="flex flex-col gap-4">
-          <Txt as="p" variant="ui-sm" className="text-icon4">
+        <DialogBody>
+          <Txt as="p" variant="caption" tone="muted">
             {session.instructions}
           </Txt>
-          <Button variant="outline" onClick={() => openAuthorizationUrl(session.url)}>
+          <Button onClick={() => openAuthorizationUrl(session.url)}>
             <ExternalLink />
             Open authorization page
           </Button>
@@ -83,22 +83,16 @@ function PasteCodeDialog({ provider, session, onClose, onComplete }: ProviderOAu
             }}
           />
           {completeMutation.error instanceof Error && (
-            <Txt as="p" variant="ui-sm" className="text-notice-destructive-fg">
+            <Txt as="p" variant="caption" className="text-destructive-foreground">
               {completeMutation.error.message}
             </Txt>
           )}
         </DialogBody>
         <DialogFooter>
-          <Button disabled={completeMutation.isPending} onClick={close}>
-            Cancel
-          </Button>
-          <Button
-            variant="primary"
-            disabled={!code.trim() || completeMutation.isPending}
-            onClick={() => void complete()}
-          >
+          <DialogCancel>Cancel</DialogCancel>
+          <DialogAction disabled={!code.trim()} onConfirm={() => void complete()}>
             {completeMutation.isPending ? 'Completing…' : 'Complete sign in'}
-          </Button>
+          </DialogAction>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -144,10 +138,6 @@ function DeviceCodeDialog({ provider, session, onClose, onComplete }: ProviderOA
     return () => window.clearTimeout(timer);
   }, [nextPollAt, poll, provider, session.sessionId]);
 
-  const copyCode = async () => {
-    if (session.userCode) await navigator.clipboard.writeText(session.userCode);
-  };
-
   const close = () => {
     if (!pollMutation.isPending) onClose();
   };
@@ -155,46 +145,43 @@ function DeviceCodeDialog({ provider, session, onClose, onComplete }: ProviderOA
   return (
     <Dialog open onOpenChange={open => !open && close()}>
       <DialogContent>
-        <DialogHeader>
+        <DialogHeader className="items-center text-center">
           <DialogTitle>Sign in to {displayName}</DialogTitle>
           <DialogDescription>Enter the device code on the provider authorization page.</DialogDescription>
         </DialogHeader>
-        <DialogBody className="flex flex-col gap-4">
-          <Txt as="p" variant="ui-sm" className="text-icon4">
-            {session.instructions}
-          </Txt>
+        <DialogBody className="items-center text-center">
           {session.userCode && (
-            <div className="flex items-center justify-between gap-3">
-              <Badge size="md" variant="info">
+            <div className="flex w-full min-w-0 items-center justify-center gap-2">
+              <Txt
+                as="span"
+                variant="title"
+                font="mono"
+                className="min-w-0 flex-1 tracking-widest break-all select-all"
+              >
                 {session.userCode}
-              </Badge>
-              <Button size="sm" onClick={() => void copyCode()}>
-                <Copy />
-                Copy code
-              </Button>
+              </Txt>
+              <CopyButton content={session.userCode} variant="ghost" size="icon-sm" tooltip="Copy code" />
             </div>
           )}
-          <Button variant="outline" onClick={() => openAuthorizationUrl(session.url)}>
+          <Button className="w-full" onClick={() => openAuthorizationUrl(session.url)}>
             <ExternalLink />
             Open authorization page
           </Button>
+        </DialogBody>
+        <DialogFooter>
           {flowError ? (
-            <Txt as="p" variant="ui-sm" className="text-notice-destructive-fg">
+            <Txt as="p" variant="caption" className="text-destructive-foreground mr-auto min-w-0 break-words">
               {flowError}
             </Txt>
           ) : (
-            <div className="text-icon4 flex items-center gap-2" role="status">
+            <div className="text-muted-foreground mr-auto flex items-center gap-2" role="status">
               <Loader2 size={14} className="motion-safe:animate-spin motion-reduce:animate-none" />
-              <Txt as="span" variant="ui-sm">
+              <Txt as="span" variant="caption">
                 Waiting for authorization…
               </Txt>
             </div>
           )}
-        </DialogBody>
-        <DialogFooter>
-          <Button disabled={pollMutation.isPending} onClick={close}>
-            Cancel
-          </Button>
+          <DialogCancel disabled={pollMutation.isPending}>Cancel</DialogCancel>
         </DialogFooter>
       </DialogContent>
     </Dialog>

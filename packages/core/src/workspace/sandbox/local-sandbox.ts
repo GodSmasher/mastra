@@ -9,7 +9,6 @@
  * - Linux: Uses bubblewrap (bwrap) for namespace isolation
  */
 
-import * as crypto from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
@@ -108,6 +107,11 @@ export interface LocalSandboxOptions extends Omit<MastraSandboxOptions, 'process
    * ```
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Encoding used to decode command stdout/stderr (any WHATWG encoding label, e.g. 'gbk').
+   * Useful on Windows systems whose native commands emit a legacy code page. Default: 'utf-8'.
+   */
+  outputEncoding?: string;
   /** Default timeout for operations in ms (default: 30000) */
   timeout?: number;
   /**
@@ -158,36 +162,38 @@ export interface LocalSandboxOptions extends Omit<MastraSandboxOptions, 'process
 }
 
 /**
- * Local sandbox implementation.
- *
- * Executes commands directly on the host machine.
- * This is the recommended sandbox for development and trusted local execution.
+ * Executes workspace commands on the host machine for development and trusted
+ * local execution. Isolation requires explicit configuration.
  *
  * @example
  * ```typescript
- * import { Workspace, LocalFilesystem, LocalSandbox } from '@mastra/core';
+ * import { Workspace, LocalSandbox } from '@mastra/core/workspace';
  *
  * const workspace = new Workspace({
- *   filesystem: new LocalFilesystem({ basePath: './my-workspace' }),
  *   sandbox: new LocalSandbox({ workingDirectory: './my-workspace' }),
  * });
- *
- * await workspace.init();
- * const result = await workspace.executeCommand('node', ['script.js']);
  * ```
+ *
+ * @see For documentation bundled with your installed package, locate
+ * `@mastra/core/package.json` with your project's resolver or package-manager
+ * tooling, then read `dist/docs/SKILL.md` from that package root and follow its
+ * reference links. Use package-manager tools for virtual or archived packages.
+ *
+ * @see [Local sandbox documentation](https://mastra.ai/reference/workspace/local-sandbox)
+ * if packaged docs are unavailable.
  */
-export class LocalSandbox extends MastraSandbox {
+export class LocalSandbox extends MastraSandbox<string> {
   readonly id: string;
   readonly name = 'LocalSandbox';
   readonly provider = 'local';
 
   status: ProviderStatus = 'pending';
 
-  readonly workingDirectory: string;
   readonly isolation: IsolationBackend;
   declare readonly processes: LocalProcessManager;
   declare readonly mounts: MountManager;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly _outputEncoding?: string;
   private _nativeSandboxConfig: NativeSandboxConfig;
   /**
    * SBPL the user wrote, read from `seatbeltProfilePath` at start. Set only when that file
@@ -217,9 +223,21 @@ export class LocalSandbox extends MastraSandbox {
   /** Chains snapshot() calls so concurrent captures never interleave. */
   private _snapshotChain: Promise<void> = Promise.resolve();
 
+  /**
+   * The effective working directory. Narrowed to `string`: the constructor
+   * always computes a value (the option, expanded, or `<cwd>/.sandbox`), so
+   * unlike the base getter this never returns `undefined`.
+   */
+  override get workingDirectory(): string {
+    return this._workingDirectory!;
+  }
+
   constructor(options: LocalSandboxOptions = {}) {
     // Validate isolation backend before super (fail fast)
     const requestedIsolation = options.isolation ?? 'none';
+    if (requestedIsolation === 'seatbelt' && process.platform === 'win32') {
+      throw new IsolationUnavailableError('seatbelt', 'Seatbelt isolation is only supported on macOS, not Windows.');
+    }
     if (requestedIsolation !== 'none' && !isIsolationAvailable(requestedIsolation)) {
       const detection = detectIsolation();
       throw new IsolationUnavailableError(requestedIsolation, detection.message);
@@ -228,13 +246,14 @@ export class LocalSandbox extends MastraSandbox {
     super({
       ...options,
       name: 'LocalSandbox',
-      processes: new LocalProcessManager({ env: options.env ?? {} }),
+      processes: new LocalProcessManager({ env: options.env ?? {}, outputEncoding: options.outputEncoding }),
     });
 
     this.id = options.id ?? this.generateId();
     this._createdAt = new Date();
-    this.workingDirectory = expandTilde(options.workingDirectory ?? path.join(process.cwd(), '.sandbox'));
+    this.setWorkingDirectory(expandTilde(options.workingDirectory ?? path.join(process.cwd(), '.sandbox')));
     this.env = options.env ?? {};
+    this._outputEncoding = options.outputEncoding;
     this._nativeSandboxConfig = {
       ...options.nativeSandbox,
       readWritePaths: [...(options.nativeSandbox?.readWritePaths ?? [])],
@@ -270,6 +289,7 @@ export class LocalSandbox extends MastraSandbox {
       workingDirectory: options.workingDirectory ?? this.workingDirectory,
       env: options.env ?? this.env,
       isolation: this.isolation,
+      outputEncoding: this._outputEncoding,
       nativeSandbox: {
         ...this._nativeSandboxConfig,
         readWritePaths: [...this._initialReadWritePaths],
@@ -291,11 +311,40 @@ export class LocalSandbox extends MastraSandbox {
   // ---------------------------------------------------------------------------
 
   /**
-   * Start the local sandbox.
-   * Creates working directory and sets up seatbelt profile if using macOS isolation.
-   * Status management is handled by the base class.
+   * Acquisition primitives (base-orchestrated start): an existing working
+   * directory is the "found sandbox" — reattaching reports `outcome: 'connected'`,
+   * a missing directory means a fresh sandbox (`outcome: 'created'`).
+   *
+   * This stat and the `mkdir` in `create()` are not atomic, so `'created'` is
+   * best-effort: two processes starting on the same working directory can both
+   * report it. Keep onStart setup idempotent.
    */
-  async start(): Promise<void> {
+  protected override async find(): Promise<string | undefined> {
+    try {
+      await fs.stat(this.workingDirectory);
+      return this.workingDirectory;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        throw err;
+      }
+      return undefined;
+    }
+  }
+
+  protected override async connect(_handle: string): Promise<void> {
+    await this._prepareWorkspace();
+  }
+
+  protected override async create(): Promise<void> {
+    await this._prepareWorkspace();
+  }
+
+  /**
+   * Shared start body for both branches: ensure the working directory
+   * exists, seed it from a checkpoint when empty, and set up the seatbelt
+   * profile on macOS. Everything here is idempotent.
+   */
+  private async _prepareWorkspace(): Promise<void> {
     this.logger.debug('Starting sandbox', {
       workingDirectory: this.workingDirectory,
       isolation: this.isolation,
@@ -344,11 +393,13 @@ export class LocalSandbox extends MastraSandbox {
 
         // Generate a deterministic hash from workspace path and config
         // This allows identical sandboxes to share profiles while preventing collisions
-        const configHash = crypto
-          .createHash('sha256')
-          .update(this.workingDirectory)
-          .update(JSON.stringify(this._nativeSandboxConfig))
-          .digest('hex')
+        const configHash = Buffer.from(
+          await globalThis.crypto.subtle.digest(
+            'SHA-256',
+            new TextEncoder().encode(this.workingDirectory + JSON.stringify(this._nativeSandboxConfig)),
+          ),
+        )
+          .toString('hex')
           .slice(0, 8);
 
         // Write profile to .sandbox-profiles/ in cwd (outside working directory)
@@ -393,9 +444,9 @@ export class LocalSandbox extends MastraSandbox {
     const candidates = [this._checkpointName, this._seedCheckpointName].filter(
       (name): name is string => name !== undefined,
     );
-    for (const name of candidates) {
+    candidates: for (const name of candidates) {
       const checkpointDir = this._checkpointPath(name);
-      if (!(await this._checkpointReadable(checkpointDir))) {
+      if (!(await this._checkpointIdentity(checkpointDir))) {
         // Missing checkpoint → try the next candidate (same contract as provider 404).
         continue;
       }
@@ -404,39 +455,45 @@ export class LocalSandbox extends MastraSandbox {
         checkpointName: name,
         checkpointDir,
       });
-      try {
-        await fs.cp(checkpointDir, this.workingDirectory, { recursive: true });
-      } catch (error) {
-        // The checkpoint was swapped away mid-copy by a concurrent
-        // `_captureCheckpoint`. Wait for the replacement and copy that instead.
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        await fs.rm(this.workingDirectory, { recursive: true, force: true }).catch(() => {});
+      // `fs.cp` is not a point-in-time copy: a concurrent `_captureCheckpoint`
+      // can swap the checkpoint directory mid-copy, mixing one version's entry
+      // list with another's file contents. Pin the directory's identity and
+      // retry the whole copy until it stays unchanged across it.
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const before = await this._checkpointIdentity(checkpointDir);
+        if (!before) continue candidates;
+        try {
+          await fs.cp(checkpointDir, this.workingDirectory, { recursive: true });
+          if ((await this._checkpointIdentity(checkpointDir)) === before) return;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        // A failed wipe must throw: copying over leftovers would pass the identity check with mixed contents.
+        await fs.rm(this.workingDirectory, { recursive: true, force: true });
         await fs.mkdir(this.workingDirectory, { recursive: true });
-        if (!(await this._checkpointReadable(checkpointDir))) continue;
-        await fs.cp(checkpointDir, this.workingDirectory, { recursive: true });
       }
-      return;
+      throw new Error(`Checkpoint "${name}" kept changing while seeding the working directory`);
     }
   }
 
   /**
-   * Check that a checkpoint directory exists, retrying briefly to cover the
-   * instant in `_captureCheckpoint` where the old checkpoint has been renamed
-   * away but the replacement has not yet been renamed into place. The window
-   * is two atomic renames, so a couple of short retries close it.
+   * Identity of the directory currently at `checkpointDir`, or undefined if no
+   * directory is there. Retries briefly to cover the instant in
+   * `_captureCheckpoint` where the old checkpoint has been renamed away but the
+   * replacement has not yet been renamed into place. The window is two atomic
+   * renames, so a couple of short retries close it.
    */
-  private async _checkpointReadable(checkpointDir: string): Promise<boolean> {
+  private async _checkpointIdentity(checkpointDir: string): Promise<string | undefined> {
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 25));
       try {
-        const stat = await fs.stat(checkpointDir);
-        if (stat.isDirectory()) return true;
-        return false;
+        const stat = await fs.stat(checkpointDir, { bigint: true });
+        return stat.isDirectory() ? `${stat.dev}:${stat.ino}:${stat.ctimeNs}` : undefined;
       } catch {
         // Missing right now — may be mid-swap; retry.
       }
     }
-    return false;
+    return undefined;
   }
 
   /**
@@ -456,8 +513,14 @@ export class LocalSandbox extends MastraSandbox {
   private async _captureCheckpoint(name: string): Promise<void> {
     const target = this._checkpointPath(name);
     await fs.mkdir(this._checkpointsDirectory, { recursive: true });
-    const tmp = path.join(this._checkpointsDirectory, `.tmp-${name}-${crypto.randomBytes(6).toString('hex')}`);
-    const backup = path.join(this._checkpointsDirectory, `.bak-${name}-${crypto.randomBytes(6).toString('hex')}`);
+    const tmp = path.join(
+      this._checkpointsDirectory,
+      `.tmp-${name}-${Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(6))).toString('hex')}`,
+    );
+    const backup = path.join(
+      this._checkpointsDirectory,
+      `.bak-${name}-${Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(6))).toString('hex')}`,
+    );
     let targetMoved = false;
     try {
       await fs.cp(this.workingDirectory, tmp, { recursive: true });
@@ -483,11 +546,19 @@ export class LocalSandbox extends MastraSandbox {
 
   /**
    * Stop the local sandbox.
-   * Unmounts all active mounts before stopping.
+   * Kills background processes and unmounts all active mounts. Unlike remote
+   * providers, a local sandbox has no suspend/resume — its background
+   * processes ARE the runtime state, so a stopped sandbox must not leave them
+   * running. Files in the working directory are untouched and `start()` works
+   * again afterwards.
    * Status management is handled by the base class.
    */
   async stop(): Promise<void> {
     this.logger.debug('Stopping sandbox', { workingDirectory: this.workingDirectory });
+
+    // Kill all background processes — "stopped" means not running.
+    const procs = await this.processes.list();
+    await Promise.all(procs.map(p => this.processes.kill(p.pid)));
 
     // Unmount all active mounts (best-effort)
     for (const mountPath of [...this._activeMountPaths]) {
