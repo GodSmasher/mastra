@@ -151,8 +151,8 @@ export const goalJudgeOmModelIsolationScenario = {
     );
     const followUpMain = typedRequests.filter(
       request =>
-        matchesFixture(request, 'gpt-5.4-mini', OBJECTIVE, FOLLOW_UP_RESPONSE) &&
-        JSON.stringify(request.body).includes(FOLLOW_UP),
+        matchesFixture(request, 'gpt-5.4-mini', FOLLOW_UP, FOLLOW_UP_RESPONSE) &&
+        JSON.stringify(request.body).includes(OBJECTIVE_PREFIX),
     );
 
     if (observerRequests.length < 1) {
