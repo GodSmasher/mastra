@@ -428,6 +428,9 @@ async function startMastraCodeApp(
         result.controller.stopIntervals(),
         closeSignalsPubSub?.(),
       ]);
+      // Let background memory work (buffered observations, indexing) finish before storage
+      // closes and the scenario's temp HOME is deleted, so none of it leaks into later scenarios.
+      if (result.memory && 'settled' in result.memory) await result.memory.settled();
       // Close storage last — checkpoints WAL and switches to DELETE journal
       // mode for local libsql, mirroring the production asyncCleanup() path.
       await result.storageMaintenance?.closeStorage?.().catch(() => {
